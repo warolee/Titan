@@ -138,10 +138,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.3.2: enemy-count validation and "
-               "Earthquake diagnostics";
+        return "Midnight Season 2 Elemental Shaman v2.3.3: Lava Burst dispatch reliability";
     }
-    RotationVersion get_version() const override { return {2, 3, 2}; }
+    RotationVersion get_version() const override { return {2, 3, 3}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -446,6 +445,12 @@ public:
         current_snapshot_target_range_valid_ = false;
         current_snapshot_target_hostile_ = false;
         clear_damage_dispatch_state();
+        dispatch_probe_ = {};
+        execution_suspect_spell_ = 0;
+        execution_suspect_escapes_ = 0;
+        execution_blocked_ = false;
+        execution_block_until_ = -999.0;
+        execution_break_message_.clear();
         last_maintenance_spell_id_ = 0;
         last_maintenance_dispatch_time_ = -999.0;
         last_ghost_wolf_dispatch_time_ = -999.0;
@@ -481,7 +486,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.3.2 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.3.3 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -619,6 +624,10 @@ public:
         if (!trinket_break_message_.empty()) {
             ctx.log(trinket_break_message_);
             trinket_break_message_.clear();
+        }
+        if (!execution_break_message_.empty()) {
+            ctx.log(execution_break_message_);
+            execution_break_message_.clear();
         }
         if (!range_fallback_message_.empty()) {
             ctx.log(range_fallback_message_);
@@ -980,6 +989,28 @@ private:
     double last_damage_suppressed_log_time_ = -999.0;
     double last_unmatched_success_log_time_ = -999.0;
 
+    // -------------------------------------------------------------------------
+    // DISPATCH EXECUTION PROBE / CIRCUIT BREAKER
+    // -------------------------------------------------------------------------
+    // Runtime proved a rotational spell can be accepted by the executor and
+    // still never reach the game. The probe records what was true at dispatch
+    // so the resolution line can name the failure, and the breaker stops a
+    // provably non-executing spell from owning the dispatcher every ~1.2s.
+    struct DispatchProbe {
+        double gcd_at_dispatch = 0.0;
+        bool locked_at_dispatch = false;
+        bool instant_expected = false;
+        uint32_t success_index_at_dispatch = 0;
+    } dispatch_probe_;
+
+    enum class DispatchResult { SuccessHistory, CastStarted, TargetChanged, Escaped };
+
+    uint32_t execution_suspect_spell_ = 0;
+    int execution_suspect_escapes_ = 0;
+    bool execution_blocked_ = false;
+    double execution_block_until_ = -999.0;
+    std::string execution_break_message_;
+
     // Long-duration buff upkeep owns a single attempt latch. It never takes
     // part in DamageDispatchState.
     uint32_t last_maintenance_spell_id_ = 0;
@@ -1026,6 +1057,11 @@ private:
         int forecast_saves = 0;
         int duplicate_dispatches_prevented = 0;
         int earthquake_opportunities = 0;
+        int lava_burst_dispatched = 0;
+        int lava_burst_confirmed = 0;
+        int lava_burst_cast_started = 0;
+        int lava_burst_escaped = 0;
+        int lava_burst_blocked = 0;
         int damage_dispatches = 0;
         int damage_started = 0;
         int damage_confirmed = 0;
@@ -1261,6 +1297,10 @@ private:
     static constexpr double kGhostWolfMoveDelay = 1.0;
     static constexpr double kGhostWolfAttempt = 1.0;
     static constexpr double kMaelstromAttributionWindow = 0.60;
+    // Four consecutive escapes with no cast start and no success event in
+    // between is not a transient miss; that spell is not reaching the game.
+    static constexpr int kExecutionBreakerEscapes = 4;
+    static constexpr double kExecutionBreakerWindow = 20.0;
     static constexpr double kSharedLockMax = 1.50;
     static constexpr double kSharedLockCluster = 0.25;
 
@@ -1484,6 +1524,133 @@ private:
         last_maelstrom_sample_time_ = now;
     }
 
+    // -------------------------------------------------------------------------
+    // DISPATCH EXECUTION EVIDENCE
+    // -------------------------------------------------------------------------
+    bool is_lava_burst_id(const rotation_api::IRotationAPI& api, uint32_t spell_id) const {
+        return spellbook_.lava_burst != 0 &&
+            logical_spell_match(api, spellbook_.lava_burst, spell_id);
+    }
+
+    // The binding Titan would press for this spell. Looked up only while
+    // building a diagnostic line or when the breaker trips, never per tick.
+    std::string spell_keybind_text(const rotation_api::IRotationAPI& api, uint32_t spell_id) const {
+        if (spell_id == 0) return "<none>";
+        if (const auto slot = api.find_spell_slot_by_id(spell_id)) {
+            return slot->keybind.empty() ? "<unbound>" : slot->keybind;
+        }
+        return "<no_slot>";
+    }
+
+    static const char* dispatch_result_name(DispatchResult result) {
+        switch (result) {
+            case DispatchResult::SuccessHistory: return "success_history";
+            case DispatchResult::CastStarted: return "cast_started";
+            case DispatchResult::TargetChanged: return "target_changed";
+            case DispatchResult::Escaped: return "escaped";
+        }
+        return "unknown";
+    }
+
+    // One compact line per interesting attempt: every escape, everything about
+    // a spell already under suspicion, and every Lava Burst attempt.
+    void log_dispatch_result(const rotation_api::IRotationAPI& api, DispatchResult result) {
+        if (!debug_diagnostics_) return;
+        const uint32_t spell_id = damage_dispatch_.spell_id;
+        const bool lava_burst = is_lava_burst_id(api, spell_id);
+        const bool suspect = execution_suspect_spell_ != 0 &&
+            logical_spell_match(api, execution_suspect_spell_, spell_id);
+        if (result != DispatchResult::Escaped && !lava_burst && !suspect) return;
+
+        const double now = api.get_game_time();
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        std::ostringstream out;
+        out << (lava_burst ? "LVB_DISPATCH_RESULT" : "DISPATCH_RESULT")
+            << " result=" << dispatch_result_name(result)
+            << " spell=" << spell_id << '/' << api.get_spell_name(spell_id)
+            << " key=" << spell_keybind_text(api, spell_id)
+            << " age=" << format_seconds(now - damage_dispatch_.dispatched_at)
+            << " gcd=" << format_seconds(dispatch_probe_.gcd_at_dispatch)
+            << '/' << format_seconds(api.get_remaining_gcd())
+            << " lock=" << (dispatch_probe_.locked_at_dispatch ? 1 : 0)
+            << " cast=" << info.spell_id << '/'
+            << (info.name.empty() ? std::string("<none>") : info.name)
+            << " succ=" << (api.get_last_spellcast_succeeded_index() -
+                            dispatch_probe_.success_index_at_dispatch)
+            << " instant=" << (dispatch_probe_.instant_expected ? 1 : 0)
+            << " charges=" << api.get_spell_current_charges(spell_id)
+            << '/' << api.get_spell_max_charges(spell_id)
+            << " castable=" << (api.can_cast_spell(spell_id) ? 1 : 0)
+            << " escapes=" << (suspect ? execution_suspect_escapes_ : 0);
+        queue_damage_debug(out.str());
+    }
+
+    // Tracks consecutive unexplained failures per logical spell. Any genuine
+    // execution evidence clears the suspicion immediately.
+    void note_dispatch_resolution(const rotation_api::IRotationAPI& api, DispatchResult result) {
+        const uint32_t spell_id = damage_dispatch_.spell_id;
+        const bool lava_burst = is_lava_burst_id(api, spell_id);
+        const bool suspect_match = execution_suspect_spell_ != 0 &&
+            logical_spell_match(api, execution_suspect_spell_, spell_id);
+
+        if (result == DispatchResult::Escaped) {
+            if (suspect_match) {
+                ++execution_suspect_escapes_;
+            } else {
+                execution_suspect_spell_ = spell_id;
+                execution_suspect_escapes_ = 1;
+            }
+            if (telemetry_combat_active_ && lava_burst) ++telemetry_.lava_burst_escaped;
+            log_dispatch_result(api, result);
+
+            if (!execution_blocked_ && execution_suspect_escapes_ >= kExecutionBreakerEscapes) {
+                execution_blocked_ = true;
+                execution_block_until_ = api.get_game_time() + kExecutionBreakerWindow;
+                execution_break_message_ =
+                    "EXECUTION_BREAKER spell=" + std::to_string(spell_id) + "/" +
+                    api.get_spell_name(spell_id) +
+                    " key=" + spell_keybind_text(api, spell_id) +
+                    " reason=no cast start and no success after " +
+                    std::to_string(execution_suspect_escapes_) +
+                    " dispatches; skipping it for " +
+                    format_seconds(kExecutionBreakerWindow) + "s";
+            }
+            return;
+        }
+
+        // Real evidence the spell reached the game.
+        if (result == DispatchResult::SuccessHistory || result == DispatchResult::CastStarted) {
+            if (telemetry_combat_active_ && lava_burst) {
+                if (result == DispatchResult::SuccessHistory) ++telemetry_.lava_burst_confirmed;
+                else ++telemetry_.lava_burst_cast_started;
+            }
+            if (suspect_match) {
+                execution_suspect_spell_ = 0;
+                execution_suspect_escapes_ = 0;
+                execution_blocked_ = false;
+                execution_block_until_ = -999.0;
+            }
+        }
+        log_dispatch_result(api, result);
+    }
+
+    // Bounded: the block always expires, and expiry allows one probe dispatch
+    // so a rebind or a fixed binding recovers on its own.
+    bool damage_execution_blocked(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
+        if (!execution_blocked_ || execution_suspect_spell_ == 0) return false;
+        if (!logical_spell_match(api, execution_suspect_spell_, spell_id)) return false;
+        if (api.get_game_time() >= execution_block_until_) {
+            // One retry probe. A single further escape re-trips immediately.
+            execution_blocked_ = false;
+            execution_suspect_escapes_ = kExecutionBreakerEscapes - 1;
+            return false;
+        }
+        if (telemetry_combat_active_ && is_lava_burst_id(api, spell_id)) {
+            ++telemetry_.lava_burst_blocked;
+        }
+        return true;
+    }
+
     // Success events are authoritative, which matters most for instants that
     // never expose a cast bar.
     void confirm_damage_dispatch(const rotation_api::IRotationAPI& api) {
@@ -1493,6 +1660,7 @@ private:
             " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
         if (telemetry_combat_active_) ++telemetry_.damage_confirmed;
         note_resolved_damage_action(api, damage_dispatch_.spell_id);
+        note_dispatch_resolution(api, DispatchResult::SuccessHistory);
         clear_damage_dispatch_pending();
         damage_dispatch_.succeeded_at = now;
     }
@@ -1515,6 +1683,7 @@ private:
         if (!damage_dispatch_.pending) return;
 
         if (damage_dispatch_.target_guid != current_guid) {
+            note_dispatch_resolution(api, DispatchResult::TargetChanged);
             clear_damage_dispatch_pending();
             return;
         }
@@ -1529,6 +1698,7 @@ private:
                 queue_damage_debug("DAMAGE_CAST_STARTED spell=" +
                     std::to_string(damage_dispatch_.spell_id) +
                     " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
+                note_dispatch_resolution(api, DispatchResult::CastStarted);
             }
             return;
         }
@@ -1547,6 +1717,7 @@ private:
             " target=" + api.get_unit_name("target") +
             " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
         if (telemetry_combat_active_) ++telemetry_.damage_escapes;
+        note_dispatch_resolution(api, DispatchResult::Escaped);
         damage_dispatch_.suppressed_spell_id = damage_dispatch_.spell_id;
         damage_dispatch_.suppressed_target_guid = damage_dispatch_.target_guid;
         damage_dispatch_.suppressed_until = now + kDamageDispatchEscapeWindow;
@@ -1609,7 +1780,19 @@ private:
         damage_dispatch_.dispatched_at = now;
         damage_dispatch_.cast_started_at = -999.0;
         damage_dispatch_.pending = true;
-        if (telemetry_combat_active_) ++telemetry_.damage_dispatches;
+
+        // Cheap scalars only. These describe the conditions the button was
+        // sent under so a later escape can be explained instead of guessed.
+        dispatch_probe_.gcd_at_dispatch = api.get_remaining_gcd();
+        dispatch_probe_.locked_at_dispatch = last_global_lock_.locked;
+        dispatch_probe_.instant_expected = has_buff_name(api, "player", "Lava Surge") &&
+            is_lava_burst_id(api, spell_id);
+        dispatch_probe_.success_index_at_dispatch = api.get_last_spellcast_succeeded_index();
+
+        if (telemetry_combat_active_) {
+            ++telemetry_.damage_dispatches;
+            if (is_lava_burst_id(api, spell_id)) ++telemetry_.lava_burst_dispatched;
+        }
         if (spell_id != last_damage_dispatch_log_spell_ ||
             (now - last_damage_dispatch_log_time_) >= 0.50)
         {
@@ -2277,7 +2460,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.3.2 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.3.3 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -2295,6 +2478,11 @@ private:
                     << " EQ_holds=" << telemetry_.earthquake_delays
                     << " forecast_saves=" << telemetry_.forecast_saves
                     << " dup_blocks=" << telemetry_.duplicate_dispatches_prevented
+                    << " lvb_dispatch=" << telemetry_.lava_burst_dispatched
+                    << " lvb_confirmed=" << telemetry_.lava_burst_confirmed
+                    << " lvb_cast_started=" << telemetry_.lava_burst_cast_started
+                    << " lvb_escaped=" << telemetry_.lava_burst_escaped
+                    << " lvb_blocked=" << telemetry_.lava_burst_blocked
                     << " dmg_dispatches=" << telemetry_.damage_dispatches
                     << " dmg_started=" << telemetry_.damage_started
                     << " dmg_confirmed=" << telemetry_.damage_confirmed
@@ -2751,6 +2939,11 @@ private:
         // confirms, starts casting, invalidates, or escapes.
         if (track_dispatch && damage_dispatch_.pending) {
             return no_action("Damage dispatch pending");
+        }
+        // A spell that has repeatedly been accepted by the executor without
+        // ever reaching the game must stop consuming the dispatcher.
+        if (track_dispatch && damage_execution_blocked(api, spell_id)) {
+            return no_action("Spell not executing");
         }
         if (track_dispatch && damage_dispatch_suppressed(api, spell_id, unit)) {
             note_damage_suppressed(api, spell_id);
@@ -3673,7 +3866,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.3.2 spell="
+        out << "DBG_CAST v2.3.3 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -3690,7 +3883,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.3.2 name="
+        out << "NO_TARGET v2.3.3 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -3708,7 +3901,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.3.2"
+        out << prefix << " v2.3.3"
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -3728,7 +3921,7 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.3.2 target="
+        out << "DBG v2.3.3 target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
