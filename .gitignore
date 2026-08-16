@@ -1,0 +1,16 @@
+# Build output
+build/
+build*/
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Compiled outputs
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
