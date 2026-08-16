@@ -32,6 +32,8 @@
 // get_custom_toggles()        = compact combat-bar buttons (Defensives, Utility, Mini/Major CDs, Burst Now).
 // get_combat_action()         = master dispatcher; its order is the global order.
 // update_cast_history()       = confirms what the game actually accepted.
+// damage dispatch state       = one generic pending/confirm/escape record shared
+//                               by every ordinary damage spell.
 // target recovery            = in-combat Tab only; never from dummy/friendly/OOC.
 // single_target_action()      = the one- and two-target Farseer priority.
 // aoe_action()                = the 3+ target Farseer cleave/Mythic+ priority.
@@ -103,6 +105,7 @@ namespace elemental_ids {
     constexpr uint32_t SKYFURY                 = 462854;
     constexpr uint32_t FLAMETONGUE_WEAPON      = 318038;
     constexpr uint32_t SPIRITWALKERS_GRACE     = 79206;
+    constexpr uint32_t GHOST_WOLF              = 2645;
     constexpr uint32_t WIND_SHEAR              = 57994;
     constexpr uint32_t ASTRAL_SHIFT            = 108271;
     constexpr uint32_t STONE_BULWARK_TOTEM     = 108270;
@@ -135,9 +138,10 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.2.12: current-target hostility continuity";
+        return "Midnight Season 2 Elemental Shaman v2.3.2: enemy-count validation and "
+               "Earthquake diagnostics";
     }
-    RotationVersion get_version() const override { return {2, 2, 12}; }
+    RotationVersion get_version() const override { return {2, 3, 2}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -163,6 +167,9 @@ public:
         schema.add_group(automation);
         schema.add(SettingDefinition::make_bool("automatic_target_recovery", "Auto Retarget", true)
             .set_description("Retargets only when your current enemy dies or becomes unreachable in combat.")
+            .set_group("automation"));
+        schema.add(SettingDefinition::make_bool("auto_ghost_wolf", "Auto Ghost Wolf", true)
+            .set_description("Automatically enters Ghost Wolf while moving between pulls.")
             .set_group("automation"));
         schema.add(SettingDefinition::make_enum("survival_profile", "Defensive Profile", 1)
             .add_enum_option(0, "Aggressive", "Delay personals to preserve damage globals")
@@ -250,6 +257,7 @@ public:
         content_mode_ = static_cast<int>(s.get_enum("content_mode", 0));
         hero_mode_ = static_cast<int>(s.get_enum("hero_mode", 0));
         automatic_target_recovery_ = s.get_bool("automatic_target_recovery", true);
+        auto_ghost_wolf_ = s.get_bool("auto_ghost_wolf", true);
         debug_diagnostics_ = s.get_bool("debug_diagnostics", false);
         cooldown_policy_ = static_cast<int>(s.get_enum("cooldown_policy", 0));
         trinket_1_mode_ = std::clamp(static_cast<int>(s.get_enum("trinket_1_mode", 2)), 0, 4);
@@ -326,6 +334,7 @@ public:
         settings["content_mode"] = static_cast<int64_t>(content_mode_);
         settings["hero_mode"] = static_cast<int64_t>(hero_mode_);
         settings["automatic_target_recovery"] = automatic_target_recovery_;
+        settings["auto_ghost_wolf"] = auto_ghost_wolf_;
         settings["debug_diagnostics"] = debug_diagnostics_;
         settings["cooldown_policy"] = static_cast<int64_t>(cooldown_policy_);
         settings["trinket_1_mode"] = static_cast<int64_t>(trinket_1_mode_);
@@ -436,6 +445,13 @@ public:
         current_snapshot_target_range_ = 0.0;
         current_snapshot_target_range_valid_ = false;
         current_snapshot_target_hostile_ = false;
+        clear_damage_dispatch_state();
+        last_maintenance_spell_id_ = 0;
+        last_maintenance_dispatch_time_ = -999.0;
+        last_ghost_wolf_dispatch_time_ = -999.0;
+        last_observed_maelstrom_ = -1;
+        last_maelstrom_sample_time_ = -999.0;
+        last_snapshot_enemies_ = 0;
         last_dup_block_key_ = 0;
         last_dup_block_window_end_ = -999.0;
         last_pack_enemy_count_ = 0;
@@ -461,10 +477,11 @@ public:
         refresh_spellbook(api);
         update_combat_telemetry(context);
         update_cast_history(api);
+        observe_maelstrom(context);
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.2.12 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.3.2 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -534,7 +551,10 @@ public:
         if (unit_looks_like_dummy(api, "target")) {
             return get_combat_action(ctx);
         }
-        return maintenance_action(api, true);
+        if (RotationAction action = maintenance_action(api, true); !action.is_none()) {
+            return action;
+        }
+        return auto_ghost_wolf_action(api);
     }
 
     // Never dismount the character by automatically casting while mounted.
@@ -552,6 +572,9 @@ public:
         const auto& api = ctx.api();
         refresh_spellbook(api);
         update_cast_history(api);
+        reconcile_damage_dispatch(api);
+        for (const std::string& message : damage_debug_messages_) ctx.log(message);
+        damage_debug_messages_.clear();
 
         // Do not replace or clip a cast/channel already in progress.
         if (api.unit_is_casting_or_channeling("player", true)) {
@@ -574,6 +597,18 @@ public:
                 kInputSettleWindow - (api.get_game_time() - last_input_dispatch_time_);
             if (remaining > 0.0) {
                 return wait_action(remaining * 1000.0, "Input settle");
+            }
+        }
+
+        // Hardcast visibility can arrive well after the 0.20s settle. While an
+        // ordinary damage dispatch is still unresolved it keeps ownership, so
+        // bridge only the remainder of its confirmation window. Nothing here
+        // re-sends, re-times, or replaces the pending action.
+        if (damage_dispatch_.pending) {
+            const double remaining = kDamageDispatchConfirmWindow -
+                (api.get_game_time() - damage_dispatch_.dispatched_at);
+            if (remaining > 0.0) {
+                return wait_action(remaining * 1000.0, "Damage dispatch pending");
             }
         }
 
@@ -620,10 +655,9 @@ public:
             }
         }
 
-        // GLOBAL PRIORITY 4: restore a missing combat maintenance buff.
-        if (RotationAction action = maintenance_action(api, false); !action.is_none()) {
-            return action;
-        }
+        // Long-duration upkeep (Lightning Shield, Skyfury, Flametongue) belongs
+        // to prepull and out-of-combat handling. Refreshing it here repeatedly
+        // stole sustained combat globals from the damage list.
 
         // Combat recovery Tabs only while already in combat. Dummies, mounted,
         // paused, and out-of-combat friendlies are left alone. In combat, a
@@ -729,6 +763,7 @@ private:
         uint32_t flametongue_weapon = 0;
         uint32_t thunderstrike_ward = 0;
         uint32_t spiritwalkers_grace = 0;
+        uint32_t ghost_wolf = 0;
         uint32_t wind_shear = 0;
         uint32_t astral_shift = 0;
         uint32_t stone_bulwark_totem = 0;
@@ -771,6 +806,15 @@ private:
         int maelstrom_deficit = 100;   // Cap minus current; 15 means 85/100.
         int flame_shocks = 0;          // Player-owned Flame Shocks in range.
         int lightning_rods = 0;        // Player-owned Lightning Rods in range.
+        // Nameplate filter instrumentation. Diagnostic only; nothing in the APL
+        // may read these.
+        int np_raw = 0;                // Entries returned by the scan.
+        int np_damageable = 0;         // Entries passing can_damage_unit().
+        int np_hostile_flags = 0;      // Entries with enemy/attack flags set.
+        int np_dummy = 0;              // Entries recognized as training dummies.
+        int np_effective = 0;          // Entries that incremented enemies.
+        int np_count_api = -1;         // Titan count API; -1 when not sampled.
+        int np_count_any = -1;         // Same scan without the combat filter.
         uint32_t stormkeeper_stacks = 0; // Charged Lightning/Chain Lightning casts.
         uint32_t tempest_stacks = 0;     // Tempest charges; protect a two-stack cap.
         uint32_t flowing_elements_stacks = 0; // SimC gates some LvBs below two.
@@ -895,6 +939,7 @@ private:
     uint32_t last_dup_block_key_ = 0;
     double last_dup_block_window_end_ = -999.0;
     bool automatic_target_recovery_ = true;
+    bool auto_ghost_wolf_ = true;
     bool automatic_prepull_ = true;
     int survival_profile_ = 1;
     int utility_profile_ = 0;
@@ -909,6 +954,60 @@ private:
     double pack_stable_since_ = -999.0;
     double last_earthquake_delay_time_ = -999.0;
     double last_forecast_save_time_ = -999.0;
+
+    // -------------------------------------------------------------------------
+    // DAMAGE DISPATCH STATE
+    // -------------------------------------------------------------------------
+    // One shared record for every ordinary rotational damage spell. Setup
+    // cooldowns keep their own attempt/pending/success latches; this only
+    // tracks whether the last recommended damage button actually became a cast.
+    struct DamageDispatchState {
+        uint32_t spell_id = 0;
+        std::string target_guid;
+        double dispatched_at = -999.0;
+        double cast_started_at = -999.0;
+        double succeeded_at = -999.0;
+        bool pending = false;
+
+        uint32_t suppressed_spell_id = 0;
+        std::string suppressed_target_guid;
+        double suppressed_until = -999.0;
+    } damage_dispatch_;
+
+    std::vector<std::string> damage_debug_messages_;
+    uint32_t last_damage_dispatch_log_spell_ = 0;
+    double last_damage_dispatch_log_time_ = -999.0;
+    double last_damage_suppressed_log_time_ = -999.0;
+    double last_unmatched_success_log_time_ = -999.0;
+
+    // Long-duration buff upkeep owns a single attempt latch. It never takes
+    // part in DamageDispatchState.
+    uint32_t last_maintenance_spell_id_ = 0;
+    double last_maintenance_dispatch_time_ = -999.0;
+    double last_ghost_wolf_dispatch_time_ = -999.0;
+
+    // -------------------------------------------------------------------------
+    // MAELSTROM OBSERVATION (DIAGNOSTIC ONLY)
+    // -------------------------------------------------------------------------
+    // Measures the real resource against resolved rotational actions. Nothing
+    // here may influence action selection.
+    struct MaelstromAttribution {
+        bool active = false;
+        bool ambiguous = false;
+        uint32_t spell_id = 0;
+        std::string spell_name;
+        int before = 0;
+        double started_at = -999.0;
+        int enemies = 0;
+        bool stormkeeper = false;
+        bool ancestral_swiftness = false;
+        bool ascendance = false;
+        bool lust = false;
+    } maelstrom_attribution_;
+
+    int last_observed_maelstrom_ = -1;
+    double last_maelstrom_sample_time_ = -999.0;
+    int last_snapshot_enemies_ = 0;
 
     struct CombatTelemetry {
         double started_at = 0.0;
@@ -926,6 +1025,22 @@ private:
         int earthquake_delays = 0;
         int forecast_saves = 0;
         int duplicate_dispatches_prevented = 0;
+        int earthquake_opportunities = 0;
+        int damage_dispatches = 0;
+        int damage_started = 0;
+        int damage_confirmed = 0;
+        int damage_escapes = 0;
+        int damage_suppressed = 0;
+        int builder_resolved = 0;
+        int builder_positive_delta = 0;
+        int builder_gain_total = 0;
+        int lightning_bolt_resolved = 0;
+        int lightning_bolt_gain = 0;
+        int chain_lightning_resolved = 0;
+        int chain_lightning_gain = 0;
+        int chain_lightning_gain_normal = 0;
+        int chain_lightning_gain_stormkeeper = 0;
+        int chain_lightning_gain_swiftness = 0;
     } telemetry_;
     bool telemetry_combat_active_ = false;
 
@@ -1094,6 +1209,7 @@ private:
         spellbook_.flametongue_weapon = resolve_spell(api, "Flametongue Weapon", elemental_ids::FLAMETONGUE_WEAPON);
         spellbook_.thunderstrike_ward = resolve_spell(api, "Thunderstrike Ward", 0);
         spellbook_.spiritwalkers_grace = resolve_spell(api, "Spiritwalker's Grace", elemental_ids::SPIRITWALKERS_GRACE);
+        spellbook_.ghost_wolf = resolve_spell(api, "Ghost Wolf", elemental_ids::GHOST_WOLF);
         spellbook_.wind_shear = resolve_spell(api, "Wind Shear", elemental_ids::WIND_SHEAR);
         spellbook_.astral_shift = resolve_spell(api, "Astral Shift", elemental_ids::ASTRAL_SHIFT);
         spellbook_.stone_bulwark_totem = resolve_spell(api, "Stone Bulwark Totem", elemental_ids::STONE_BULWARK_TOTEM);
@@ -1139,6 +1255,12 @@ private:
     static constexpr double kUnreachableDwell = 0.60;
     static constexpr double kCloseRangeFallback = 10.0;
     static constexpr double kHostileGuidGrace = 0.35;
+    static constexpr double kDamageDispatchConfirmWindow = 0.45;
+    static constexpr double kDamageDispatchEscapeWindow = 0.75;
+    static constexpr double kMaintenanceAttemptWindow = 2.0;
+    static constexpr double kGhostWolfMoveDelay = 1.0;
+    static constexpr double kGhostWolfAttempt = 1.0;
+    static constexpr double kMaelstromAttributionWindow = 0.60;
     static constexpr double kSharedLockMax = 1.50;
     static constexpr double kSharedLockCluster = 0.25;
 
@@ -1165,6 +1287,338 @@ private:
 
     void note_input_dispatch(const rotation_api::IRotationAPI& api) {
         last_input_dispatch_time_ = api.get_game_time();
+    }
+
+    // -------------------------------------------------------------------------
+    // DAMAGE DISPATCH RECONCILIATION
+    // -------------------------------------------------------------------------
+    void clear_damage_dispatch_pending() {
+        damage_dispatch_.spell_id = 0;
+        damage_dispatch_.target_guid.clear();
+        damage_dispatch_.dispatched_at = -999.0;
+        damage_dispatch_.cast_started_at = -999.0;
+        damage_dispatch_.pending = false;
+    }
+
+    void clear_damage_dispatch_suppression() {
+        damage_dispatch_.suppressed_spell_id = 0;
+        damage_dispatch_.suppressed_target_guid.clear();
+        damage_dispatch_.suppressed_until = -999.0;
+    }
+
+    void clear_damage_dispatch_state() {
+        damage_dispatch_ = {};
+        damage_debug_messages_.clear();
+        last_damage_dispatch_log_spell_ = 0;
+        last_damage_dispatch_log_time_ = -999.0;
+        last_damage_suppressed_log_time_ = -999.0;
+        last_unmatched_success_log_time_ = -999.0;
+        maelstrom_attribution_ = {};
+    }
+
+    // One generic identity test. Titan can report a runtime/override ID that
+    // differs from the ID the rotation dispatched, so exact equality alone
+    // produces false escapes.
+    bool logical_spell_match(const rotation_api::IRotationAPI& api,
+                             uint32_t left,
+                             uint32_t right) const
+    {
+        if (left == 0 || right == 0) return false;
+        if (left == right) return true;
+        if (api.get_override_spell(left) == right) return true;
+        if (api.get_override_spell(right) == left) return true;
+        const std::string left_name = api.get_spell_name(left);
+        if (left_name.empty()) return false;
+        const std::string right_name = api.get_spell_name(right);
+        if (right_name.empty()) return false;
+        return same_name(left_name, right_name);
+    }
+
+    static std::string format_seconds(double seconds) {
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(2) << seconds;
+        return out.str();
+    }
+
+    void queue_damage_debug(std::string message) {
+        if (!debug_diagnostics_) return;
+        if (damage_debug_messages_.size() >= 4) return;
+        damage_debug_messages_.push_back(std::move(message));
+    }
+
+    // -------------------------------------------------------------------------
+    // MAELSTROM OBSERVATION (DIAGNOSTIC ONLY)
+    // -------------------------------------------------------------------------
+    bool is_builder_spell(const rotation_api::IRotationAPI& api, uint32_t spell_id) const {
+        const uint32_t builders[] = {
+            spellbook_.lightning_bolt, spellbook_.chain_lightning,
+            spellbook_.lava_burst, spellbook_.flame_shock,
+            spellbook_.frost_shock, spellbook_.tempest,
+            spellbook_.voltaic_blaze
+        };
+        for (uint32_t candidate : builders) {
+            if (candidate != 0 && logical_spell_match(api, candidate, spell_id)) return true;
+        }
+        return false;
+    }
+
+    static bool has_lust_buff(const rotation_api::IRotationAPI& api) {
+        static const char* names[] = {
+            "Bloodlust", "Heroism", "Time Warp", "Fury of the Aspects",
+            "Primal Rage", "Ancient Hysteria", "Drums of Rage"
+        };
+        for (const char* name : names) {
+            if (has_buff_name(api, "player", name)) return true;
+        }
+        return false;
+    }
+
+    // Opens one conservative attribution window when a rotational damage spell
+    // reports success, which is where the game actually grants or spends
+    // Maelstrom. Resource movement is measured, never assumed, and never feeds
+    // back into action selection.
+    void note_resolved_damage_action(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
+        if (spell_id == 0) return;
+        if (!is_rotation_damage_spell_id(spell_id) &&
+            !is_rotation_damage_spell_name(api.get_spell_name(spell_id)))
+        {
+            return;
+        }
+
+        // Two resolutions inside one window cannot be told apart safely.
+        if (maelstrom_attribution_.active) {
+            maelstrom_attribution_.ambiguous = true;
+            return;
+        }
+
+        maelstrom_attribution_.active = true;
+        maelstrom_attribution_.ambiguous = false;
+        maelstrom_attribution_.spell_id = spell_id;
+        maelstrom_attribution_.spell_name = api.get_spell_name(spell_id);
+        maelstrom_attribution_.before = last_observed_maelstrom_ >= 0
+            ? last_observed_maelstrom_ : api.get_player_power("maelstrom");
+        maelstrom_attribution_.started_at = api.get_game_time();
+        maelstrom_attribution_.enemies = last_snapshot_enemies_;
+        maelstrom_attribution_.stormkeeper = has_buff_name(api, "player", "Stormkeeper");
+        maelstrom_attribution_.ancestral_swiftness = has_buff_name(api, "player", "Ancestral Swiftness");
+        maelstrom_attribution_.ascendance = has_buff_name(api, "player", "Ascendance");
+        maelstrom_attribution_.lust = has_lust_buff(api);
+    }
+
+    void tally_maelstrom_delta(const rotation_api::IRotationAPI& api,
+                               const MaelstromAttribution& attribution,
+                               int delta)
+    {
+        if (!telemetry_combat_active_ || attribution.ambiguous) return;
+        if (!is_builder_spell(api, attribution.spell_id)) return;
+
+        ++telemetry_.builder_resolved;
+        if (delta > 0) {
+            ++telemetry_.builder_positive_delta;
+            telemetry_.builder_gain_total += delta;
+        }
+
+        if (spellbook_.lightning_bolt != 0 &&
+            logical_spell_match(api, spellbook_.lightning_bolt, attribution.spell_id))
+        {
+            ++telemetry_.lightning_bolt_resolved;
+            if (delta > 0) telemetry_.lightning_bolt_gain += delta;
+        }
+
+        if (spellbook_.chain_lightning != 0 &&
+            logical_spell_match(api, spellbook_.chain_lightning, attribution.spell_id))
+        {
+            ++telemetry_.chain_lightning_resolved;
+            if (delta > 0) {
+                telemetry_.chain_lightning_gain += delta;
+                if (attribution.stormkeeper) {
+                    telemetry_.chain_lightning_gain_stormkeeper += delta;
+                } else if (attribution.ancestral_swiftness) {
+                    telemetry_.chain_lightning_gain_swiftness += delta;
+                } else {
+                    telemetry_.chain_lightning_gain_normal += delta;
+                }
+            }
+        }
+    }
+
+    void observe_maelstrom(const RotationContext& context) {
+        const auto& api = context.api();
+        const int current = api.get_player_power("maelstrom");
+        const double now = api.get_game_time();
+
+        if (maelstrom_attribution_.active) {
+            const bool moved = current != maelstrom_attribution_.before;
+            const bool expired =
+                (now - maelstrom_attribution_.started_at) >= kMaelstromAttributionWindow;
+            if (moved || expired) {
+                const int delta = current - maelstrom_attribution_.before;
+                tally_maelstrom_delta(api, maelstrom_attribution_, delta);
+                if (debug_diagnostics_ && delta != 0) {
+                    std::ostringstream out;
+                    out << "MAELSTROM_DELTA spell=";
+                    if (maelstrom_attribution_.ambiguous) {
+                        out << "unknown";
+                    } else {
+                        out << maelstrom_attribution_.spell_id << '/'
+                            << (maelstrom_attribution_.spell_name.empty()
+                                    ? std::string("?")
+                                    : maelstrom_attribution_.spell_name);
+                    }
+                    out << " before=" << maelstrom_attribution_.before
+                        << " after=" << current
+                        << " delta=" << (delta > 0 ? "+" : "") << delta
+                        << " enemies=" << maelstrom_attribution_.enemies
+                        << " stormkeeper=" << (maelstrom_attribution_.stormkeeper ? 1 : 0)
+                        << " ancestral_swiftness="
+                        << (maelstrom_attribution_.ancestral_swiftness ? 1 : 0)
+                        << " ascendance=" << (maelstrom_attribution_.ascendance ? 1 : 0)
+                        << " lust=" << (maelstrom_attribution_.lust ? 1 : 0);
+                    context.log(out.str());
+                }
+                maelstrom_attribution_ = {};
+            }
+        }
+
+        last_observed_maelstrom_ = current;
+        last_maelstrom_sample_time_ = now;
+    }
+
+    // Success events are authoritative, which matters most for instants that
+    // never expose a cast bar.
+    void confirm_damage_dispatch(const rotation_api::IRotationAPI& api) {
+        const double now = api.get_game_time();
+        queue_damage_debug("DAMAGE_CONFIRMED spell=" +
+            std::to_string(damage_dispatch_.spell_id) +
+            " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
+        if (telemetry_combat_active_) ++telemetry_.damage_confirmed;
+        note_resolved_damage_action(api, damage_dispatch_.spell_id);
+        clear_damage_dispatch_pending();
+        damage_dispatch_.succeeded_at = now;
+    }
+
+    // Runs before the active-cast guard so a hardcast that genuinely started is
+    // never classified as a failed dispatch.
+    void reconcile_damage_dispatch(const rotation_api::IRotationAPI& api) {
+        const double now = api.get_game_time();
+        const std::string current_guid = api.unit_exists("target")
+            ? api.get_unit_guid("target") : std::string{};
+
+        // A new enemy must never inherit the previous enemy's failed attempt.
+        if (!damage_dispatch_.suppressed_target_guid.empty() &&
+            (damage_dispatch_.suppressed_target_guid != current_guid ||
+             now >= damage_dispatch_.suppressed_until))
+        {
+            clear_damage_dispatch_suppression();
+        }
+
+        if (!damage_dispatch_.pending) return;
+
+        if (damage_dispatch_.target_guid != current_guid) {
+            clear_damage_dispatch_pending();
+            return;
+        }
+
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        if (info.is_active() &&
+            logical_spell_match(api, damage_dispatch_.spell_id, info.spell_id))
+        {
+            if (damage_dispatch_.cast_started_at < 0.0) {
+                damage_dispatch_.cast_started_at = now;
+                if (telemetry_combat_active_) ++telemetry_.damage_started;
+                queue_damage_debug("DAMAGE_CAST_STARTED spell=" +
+                    std::to_string(damage_dispatch_.spell_id) +
+                    " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
+            }
+            return;
+        }
+
+        // The cast bar was seen at least once, so the attempt reached the game.
+        // Its outcome belongs to the success history, not to failure recovery.
+        if (damage_dispatch_.cast_started_at > 0.0) {
+            clear_damage_dispatch_pending();
+            return;
+        }
+
+        if ((now - damage_dispatch_.dispatched_at) < kDamageDispatchConfirmWindow) return;
+
+        queue_damage_debug("DAMAGE_DISPATCH_ESCAPE spell=" +
+            std::to_string(damage_dispatch_.spell_id) +
+            " target=" + api.get_unit_name("target") +
+            " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
+        if (telemetry_combat_active_) ++telemetry_.damage_escapes;
+        damage_dispatch_.suppressed_spell_id = damage_dispatch_.spell_id;
+        damage_dispatch_.suppressed_target_guid = damage_dispatch_.target_guid;
+        damage_dispatch_.suppressed_until = now + kDamageDispatchEscapeWindow;
+        clear_damage_dispatch_pending();
+    }
+
+    // Suppression is exact: this logical spell, on this GUID, for this window.
+    bool damage_dispatch_suppressed(const rotation_api::IRotationAPI& api,
+                                    uint32_t spell_id,
+                                    const std::string& unit) const
+    {
+        if (damage_dispatch_.suppressed_spell_id == 0) return false;
+        if (!logical_spell_match(api, damage_dispatch_.suppressed_spell_id, spell_id)) {
+            return false;
+        }
+        if (api.get_game_time() >= damage_dispatch_.suppressed_until) return false;
+        const std::string guid = api.get_unit_guid(unit);
+        return !guid.empty() && guid == damage_dispatch_.suppressed_target_guid;
+    }
+
+    // Surfaces what Titan actually reports when a rotational success cannot be
+    // tied to the pending dispatch. Purely informational.
+    void note_unmatched_success(const rotation_api::IRotationAPI& api,
+                                uint32_t event_spell_id,
+                                const std::string& event_name)
+    {
+        if (!debug_diagnostics_) return;
+        const double now = api.get_game_time();
+        if ((now - last_unmatched_success_log_time_) < 1.0) return;
+        last_unmatched_success_log_time_ = now;
+        queue_damage_debug("DAMAGE_UNMATCHED_SUCCESS pending=" +
+            std::to_string(damage_dispatch_.spell_id) + "/" +
+            api.get_spell_name(damage_dispatch_.spell_id) +
+            " event=" + std::to_string(event_spell_id) + "/" + event_name);
+    }
+
+    void note_damage_suppressed(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
+        const double now = api.get_game_time();
+        if (telemetry_combat_active_) ++telemetry_.damage_suppressed;
+        if ((now - last_damage_suppressed_log_time_) < 0.75) return;
+        last_damage_suppressed_log_time_ = now;
+        queue_damage_debug("DAMAGE_SUPPRESSED spell=" + std::to_string(spell_id) +
+            " target=" + api.get_unit_name("target") +
+            " remaining=" + format_seconds(damage_dispatch_.suppressed_until - now));
+    }
+
+    void record_damage_dispatch(const rotation_api::IRotationAPI& api,
+                                uint32_t spell_id,
+                                const std::string& unit)
+    {
+        const double now = api.get_game_time();
+        const std::string guid = api.get_unit_guid(unit);
+
+        // Nothing may replace an unresolved dispatch, so the original
+        // timestamp always survives and the confirmation window can expire.
+        if (damage_dispatch_.pending) return;
+
+        damage_dispatch_.spell_id = spell_id;
+        damage_dispatch_.target_guid = guid;
+        damage_dispatch_.dispatched_at = now;
+        damage_dispatch_.cast_started_at = -999.0;
+        damage_dispatch_.pending = true;
+        if (telemetry_combat_active_) ++telemetry_.damage_dispatches;
+        if (spell_id != last_damage_dispatch_log_spell_ ||
+            (now - last_damage_dispatch_log_time_) >= 0.50)
+        {
+            last_damage_dispatch_log_spell_ = spell_id;
+            last_damage_dispatch_log_time_ = now;
+            queue_damage_debug("DAMAGE_DISPATCH spell=" + std::to_string(spell_id) +
+                " target=" + api.get_unit_name(unit) +
+                " guid=" + damage_dispatch_.target_guid);
+        }
     }
 
     void note_duplicate_prevented(uint32_t key, double window_end) {
@@ -1238,7 +1692,8 @@ private:
             return no_action("Voltaic setup settling");
         }
         if (!eligible) return no_action("Unavailable");
-        RotationAction action = cast_damage(api, spellbook_.voltaic_blaze, state.target, reason);
+        RotationAction action = cast_damage(api, spellbook_.voltaic_blaze, state.target, reason,
+            true, false);
         if (!action.is_none()) {
             voltaic_setup_pending_until_ = now + kVoltaicSetupPendingWindow;
             last_voltaic_setup_dispatch_time_ = now;
@@ -1687,6 +2142,7 @@ private:
             last_processed_success_index_ = 0;
             last_damage_success_index_ = 0;
             last_successful_damage_spell_.clear();
+            clear_damage_dispatch_state();
         }
 
         uint32_t highest_seen = last_processed_success_index_;
@@ -1755,7 +2211,29 @@ private:
                 }
             }
 
-            if ((is_rotation_damage_spell_name(name) || is_rotation_damage_spell_id(event.spell_id)) &&
+            const bool rotational_damage_event =
+                is_rotation_damage_spell_name(name) || is_rotation_damage_spell_id(event.spell_id);
+
+            if (damage_dispatch_.pending) {
+                if (logical_spell_match(api, damage_dispatch_.spell_id, event.spell_id)) {
+                    confirm_damage_dispatch(api);
+                } else if (rotational_damage_event) {
+                    // Diagnostic only. Titan reporting an unfamiliar ID must not
+                    // suppress or escape anything by itself.
+                    note_unmatched_success(api, event.spell_id, name);
+                    note_resolved_damage_action(api, event.spell_id);
+                }
+            } else if (rotational_damage_event) {
+                note_resolved_damage_action(api, event.spell_id);
+            }
+
+            if (damage_dispatch_.suppressed_spell_id != 0 &&
+                logical_spell_match(api, damage_dispatch_.suppressed_spell_id, event.spell_id))
+            {
+                clear_damage_dispatch_suppression();
+            }
+
+            if (rotational_damage_event &&
                 event.index > last_damage_success_index_)
             {
                 last_damage_success_index_ = event.index;
@@ -1799,12 +2277,16 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.2.12 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.3.2 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
                     << " spenders=" << telemetry_.spenders
                     << " EQ=" << telemetry_.earthquakes
+                    << " EQ_opp=" << telemetry_.earthquake_opportunities
+                    << " EQ_cpm=" << std::fixed << std::setprecision(2)
+                    << (duration > 0.0 ? telemetry_.earthquakes * 60.0 / duration : 0.0)
+                    << std::setprecision(1)
                     << " EB=" << telemetry_.elemental_blasts
                     << " SK=" << telemetry_.stormkeepers
                     << " Asc=" << telemetry_.ascendances
@@ -1812,10 +2294,26 @@ private:
                     << " retargets=" << telemetry_.target_recoveries
                     << " EQ_holds=" << telemetry_.earthquake_delays
                     << " forecast_saves=" << telemetry_.forecast_saves
-                    << " dup_blocks=" << telemetry_.duplicate_dispatches_prevented;
+                    << " dup_blocks=" << telemetry_.duplicate_dispatches_prevented
+                    << " dmg_dispatches=" << telemetry_.damage_dispatches
+                    << " dmg_started=" << telemetry_.damage_started
+                    << " dmg_confirmed=" << telemetry_.damage_confirmed
+                    << " dmg_escapes=" << telemetry_.damage_escapes
+                    << " dmg_suppressed=" << telemetry_.damage_suppressed
+                    << " builder_resolved=" << telemetry_.builder_resolved
+                    << " builder_positive_delta=" << telemetry_.builder_positive_delta
+                    << " builder_gain_total=" << telemetry_.builder_gain_total
+                    << " lb_resolved=" << telemetry_.lightning_bolt_resolved
+                    << " lb_gain=" << telemetry_.lightning_bolt_gain
+                    << " cl_resolved=" << telemetry_.chain_lightning_resolved
+                    << " cl_gain=" << telemetry_.chain_lightning_gain
+                    << " cl_gain_normal=" << telemetry_.chain_lightning_gain_normal
+                    << " cl_gain_stormkeeper=" << telemetry_.chain_lightning_gain_stormkeeper
+                    << " cl_gain_ancestral_swiftness=" << telemetry_.chain_lightning_gain_swiftness;
                 context.log(report.str());
             }
             telemetry_combat_active_ = false;
+            clear_damage_dispatch_state();
         }
     }
 
@@ -1960,12 +2458,29 @@ private:
         double pack_health_max = 0.0;
         double pack_range_sum = 0.0;
         int pack_range_samples = 0;
+        state.np_raw = static_cast<int>(nameplates.size());
         for (const auto& enemy : nameplates) {
             const std::string unit = enemy.unit_token;
             if (unit.empty() || !can_damage_unit(api, unit)) continue;
-            if (!api.unit_is_enemy(unit) && !api.unit_can_attack(unit)) continue;
+            ++state.np_damageable;
+
+            const bool hostile_flags = api.unit_is_enemy(unit) || api.unit_can_attack(unit);
+            if (hostile_flags) ++state.np_hostile_flags;
+
+            // can_damage_unit() deliberately keeps a recognized training dummy
+            // legal when its unit state reads oddly, but the hostility test
+            // below used to discard it again. The exception is re-applied here
+            // for positively recognized dummies only. The check is skipped for
+            // ordinary hostiles unless diagnostics asked for the tally.
+            bool dummy = false;
+            if (!hostile_flags || debug_diagnostics_) {
+                dummy = unit_looks_like_dummy(api, unit);
+                if (dummy) ++state.np_dummy;
+            }
+            if (!hostile_flags && !dummy) continue;
 
             ++state.enemies;
+            ++state.np_effective;
             if (enemy.range.has_value()) {
                 pack_range_sum += enemy.range.value();
                 ++pack_range_samples;
@@ -2011,6 +2526,14 @@ private:
                     state.dangerous_cast_remaining = remaining;
                 }
             }
+        }
+
+        // Titan's own count is sampled only while diagnostics are on. The
+        // second sample drops the in-combat filter so a nameplate the scan
+        // never returned can be told apart from one the filters removed.
+        if (debug_diagnostics_) {
+            state.np_count_api = static_cast<int>(api.get_nameplates_in_range_count(40.0, true, false));
+            state.np_count_any = static_cast<int>(api.get_nameplates_in_range_count(40.0, false, false));
         }
 
         // Hostile-nameplate evidence for this tick is complete, so the current
@@ -2065,6 +2588,7 @@ private:
             ? capped_targets * (capped_targets + 4)
             : (has_buff_name(api, "player", "Stormkeeper") ? 20 : 8);
         state.forecast_overcap = state.maelstrom_deficit <= state.forecast_builder_gain;
+        last_snapshot_enemies_ = state.enemies;
         state.player_hp = api.get_unit_health_percent("player");
         if (!state.target.empty()) {
             state.target_hp = api.get_unit_health_percent(state.target);
@@ -2210,19 +2734,33 @@ private:
         range_fallback_message_ = out.str();
     }
 
+    // "track_dispatch" is false for actions that own a different confirmation
+    // system: setup Voltaic Blaze, interrupts, and utility Purge.
     RotationAction cast_damage(const rotation_api::IRotationAPI& api,
                                uint32_t spell_id,
                                const std::string& unit,
                                const std::string& reason,
-                               bool check_range = true)
+                               bool check_range = true,
+                               bool track_dispatch = true)
     {
         if (!can_damage_action_target(api, unit) || !can_cast(api, spell_id)) {
             return no_action("Unavailable");
+        }
+        // An unresolved dispatch owns the damage dispatcher. No tracked damage
+        // action - the same spell or a different one - may be sent until it
+        // confirms, starts casting, invalidates, or escapes.
+        if (track_dispatch && damage_dispatch_.pending) {
+            return no_action("Damage dispatch pending");
+        }
+        if (track_dispatch && damage_dispatch_suppressed(api, spell_id, unit)) {
+            note_damage_suppressed(api, spell_id);
+            return no_action("Damage dispatch suppressed");
         }
         if (check_range && !damage_spell_in_range(api, spell_id, unit, true)) {
             return no_action("Out of range");
         }
         note_input_dispatch(api);
+        if (track_dispatch) record_damage_dispatch(api, spell_id, unit);
         return spell(spell_id, unit, reason);
     }
 
@@ -2283,6 +2821,12 @@ private:
             }
             return no_action("Earthquake held while pack is gathering");
         }
+        // The APL only reaches this point when Earthquake is a legitimate
+        // current candidate, which makes it the one unambiguous place to count
+        // discrete opportunities against confirmed casts.
+        if (telemetry_combat_active_ && state.use_aoe_list && state.enemies >= 3) {
+            ++telemetry_.earthquake_opportunities;
+        }
         if (state.talent_earthquake) {
             return cast_damage(api, spellbook_.earthquake, state.target,
                 reason + " Earthquake on target");
@@ -2295,37 +2839,109 @@ private:
     // -------------------------------------------------------------------------
     // MAINTENANCE / SURVIVAL / MYTHIC+ SUPPORT
     // -------------------------------------------------------------------------
-    // "allow_weapon" is true before/outside combat and false during combat so
-    // the profile does not waste a damage GCD repeatedly checking weapon imbue.
+    // Long-duration upkeep runs prepull and out of combat only, where
+    // "allow_weapon" also permits the weapon imbue check.
+    // Redundant aura evidence. A hidden or renamed numeric aura must not make
+    // the profile believe a long-duration buff is missing.
+    bool has_maintenance_aura(const rotation_api::IRotationAPI& api,
+                              uint32_t cast_id,
+                              uint32_t known_aura_id,
+                              const std::string& name) const
+    {
+        if (cast_id != 0 && api.has_buff("player", cast_id, false)) return true;
+        if (known_aura_id != 0 && api.has_buff("player", known_aura_id, false)) return true;
+        return has_buff_name(api, "player", name);
+    }
+
+    // Aura propagation is not instant. One shared latch prevents the
+    // "Lightning Shield x5" burst that used to consume several globals.
+    RotationAction maintenance_dispatch(const rotation_api::IRotationAPI& api,
+                                        uint32_t spell_id,
+                                        const std::string& reason)
+    {
+        const double now = api.get_game_time();
+        if (spell_id == last_maintenance_spell_id_ &&
+            recently_attempted(last_maintenance_dispatch_time_, kMaintenanceAttemptWindow, now))
+        {
+            return no_action("Maintenance settling");
+        }
+        last_maintenance_spell_id_ = spell_id;
+        last_maintenance_dispatch_time_ = now;
+        note_input_dispatch(api);
+        return spell(spell_id, "player", reason);
+    }
+
     RotationAction maintenance_action(const rotation_api::IRotationAPI& api, bool allow_weapon) {
         // Priority 1: Lightning Shield is required for core Shaman interactions.
         if (can_cast(api, spellbook_.lightning_shield) &&
-            !has_buff_name(api, "player", "Lightning Shield"))
+            !has_maintenance_aura(api, spellbook_.lightning_shield,
+                                  elemental_ids::LIGHTNING_SHIELD, "Lightning Shield"))
         {
-            return spell(spellbook_.lightning_shield, "player", "Maintain Lightning Shield");
+            if (RotationAction action = maintenance_dispatch(api, spellbook_.lightning_shield,
+                    "Maintain Lightning Shield"); !action.is_none())
+            {
+                return action;
+            }
         }
 
         // Priority 2: the supplied guide requires the one-hour Skyfury group
         // buff. Casting it on the player applies it to the party/raid as well.
         if (can_cast(api, spellbook_.skyfury) &&
-            !has_buff_name(api, "player", "Skyfury"))
+            !has_maintenance_aura(api, spellbook_.skyfury, elemental_ids::SKYFURY, "Skyfury"))
         {
-            return spell(spellbook_.skyfury, "player", "Maintain Skyfury");
+            if (RotationAction action = maintenance_dispatch(api, spellbook_.skyfury,
+                    "Maintain Skyfury"); !action.is_none())
+            {
+                return action;
+            }
         }
 
         // Priority 3: maintain Flametongue only when weapon maintenance is safe.
         if (allow_weapon && can_cast(api, spellbook_.flametongue_weapon) && !api.has_main_hand_enchant()) {
-            return spell(spellbook_.flametongue_weapon, "player", "Maintain Flametongue Weapon");
+            if (RotationAction action = maintenance_dispatch(api, spellbook_.flametongue_weapon,
+                    "Maintain Flametongue Weapon"); !action.is_none())
+            {
+                return action;
+            }
         }
 
         // Priority 4: maintain the Midnight Thunderstrike Ward when talented.
         if (can_cast(api, spellbook_.thunderstrike_ward) &&
-            !has_buff_name(api, "player", "Thunderstrike Ward"))
+            !has_maintenance_aura(api, spellbook_.thunderstrike_ward, 0, "Thunderstrike Ward"))
         {
-            return spell(spellbook_.thunderstrike_ward, "player", "Maintain Thunderstrike Ward");
+            if (RotationAction action = maintenance_dispatch(api, spellbook_.thunderstrike_ward,
+                    "Maintain Thunderstrike Ward"); !action.is_none())
+            {
+                return action;
+            }
         }
 
         return no_action(allow_weapon ? "Maintenance complete" : "No combat maintenance");
+    }
+
+    // Travel form between pulls only. Combat movement stays with the existing
+    // Spiritwalker's Grace / instant-cast handling.
+    RotationAction auto_ghost_wolf_action(const rotation_api::IRotationAPI& api) {
+        if (!auto_ghost_wolf_) return no_action("Auto Ghost Wolf disabled");
+        if (api.is_in_combat_lockdown()) return no_action("In combat");
+        if (spellbook_.ghost_wolf == 0) return no_action("Ghost Wolf unknown");
+        if (!api.is_player_moving()) return no_action("Not moving");
+        if (api.unit_is_casting_or_channeling("player", true)) return no_action("Casting");
+        if (has_buff_name(api, "player", "Ghost Wolf")) return no_action("Ghost Wolf active");
+
+        const double now = api.get_game_time();
+        const double moving_since = api.get_player_started_moving_time();
+        if (moving_since <= 0.0 || (now - moving_since) < kGhostWolfMoveDelay) {
+            return no_action("Movement too short");
+        }
+        if (!can_cast(api, spellbook_.ghost_wolf)) return no_action("Ghost Wolf unavailable");
+        if (recently_attempted(last_ghost_wolf_dispatch_time_, kGhostWolfAttempt, now)) {
+            return no_action("Ghost Wolf settling");
+        }
+
+        last_ghost_wolf_dispatch_time_ = now;
+        note_input_dispatch(api);
+        return spell(spellbook_.ghost_wolf, "player", "Auto Ghost Wolf");
     }
 
     // Defensive thresholds rise gradually in high keys. A level 17 key, for
@@ -2491,7 +3107,8 @@ private:
 
         if (!best.valid) return no_action("No interrupt");
         if (RotationAction action = cast_damage(api, spellbook_.wind_shear, best.unit,
-                best.priority ? "Wind Shear priority cast" : "Wind Shear"); !action.is_none())
+                best.priority ? "Wind Shear priority cast" : "Wind Shear", true, false);
+            !action.is_none())
         {
             return action;
         }
@@ -2608,7 +3225,8 @@ private:
                         {"Purge.HighPriority", "Dispel.Purge", "Elemental.Purge.Priority"}))
             {
                 if (RotationAction action = cast_damage(api, spellbook_.purge, state.target,
-                        "Purge listed priority buff on current target"); !action.is_none())
+                        "Purge listed priority buff on current target", true, false);
+                    !action.is_none())
                 {
                     return action;
                 }
@@ -2618,7 +3236,8 @@ private:
                 has_dispellable_magic_buff(api, state.target))
             {
                 if (RotationAction action = cast_damage(api, spellbook_.purge, state.target,
-                        "Purge current-target magic buff"); !action.is_none())
+                        "Purge current-target magic buff", true, false);
+                    !action.is_none())
                 {
                     return action;
                 }
@@ -2921,6 +3540,63 @@ private:
         return "solo";
     }
 
+    // Names the active Elemental Blast stat aura. Built only inside the
+    // rate-limited debug snapshot, so it costs one aura scan per debug line.
+    std::string debug_elemental_blast_buff(const rotation_api::IRotationAPI& api,
+                                           const CombatState& state) const
+    {
+        if (!state.buff_elemental_blast_stat) return "none";
+        for (const auto& aura : api.get_buffs("player", false)) {
+            if (!contains_name(aura.name, "Elemental Blast")) continue;
+            if (contains_name(aura.name, "Critical")) return "crit";
+            if (contains_name(aura.name, "Haste")) return "haste";
+            if (contains_name(aura.name, "Mastery")) return "mastery";
+            return "1";
+        }
+        return "1";
+    }
+
+    // Reports the first reason the live AoE list cannot reach an Earthquake,
+    // using the real v2.3.2 conditions. Diagnostic only: this mirrors the APL,
+    // it never influences it.
+    std::string earthquake_gate_debug(const rotation_api::IRotationAPI& api,
+                                      const CombatState& state) const
+    {
+        if (spellbook_.earthquake == 0) return "0:unknown";
+        if (!api.is_aoe_enabled()) return "0:aoe_off";
+        if (!state.use_aoe_list) return "0:targets";
+        if (!can_cast(api, spellbook_.earthquake)) return "0:not_castable";
+        if (!state.earthquake_safe) return "0:unsafe";
+
+        // AOE 6: Lightning Rod spread.
+        const int rod_threshold = 3 + (state.talent_elemental_blast ? 1 : 0);
+        const bool rod_targets = state.enemies >= rod_threshold;
+        const bool rod_buff = state.buff_elemental_blast_stat || !state.talent_elemental_blast;
+        if (state.tempest_stacks < 2 && state.lightning_rods < state.enemies &&
+            rod_targets && rod_buff)
+        {
+            return "1:rod_spread";
+        }
+
+        // AOE 8: tier free spender routes to Earthquake without EB talented.
+        if (state.buff_overcharge_tier && !state.talent_elemental_blast) return "1:tier";
+
+        // AOE 14: paid Earthquake exists only without Elemental Blast.
+        if (!state.talent_elemental_blast) {
+            if (state.bank_maelstrom) return "0:bank";
+            const int chain_targets = std::min(5, std::max(1, state.enemies));
+            const int gate = spender_deficit_ +
+                (state.buff_stormkeeper ? chain_targets * (chain_targets + 2) : 0);
+            return state.maelstrom_deficit < gate ? "1:normal" : "0:deficit";
+        }
+
+        if (state.tempest_stacks >= 2) return "0:tempest";
+        if (state.lightning_rods >= state.enemies) return "0:rods_full";
+        if (!rod_targets) return "0:eb_targets";
+        if (!state.buff_elemental_blast_stat) return "0:eb_setup";
+        return "0:eb_spender";
+    }
+
     std::string debug_cooldown_gate(const rotation_api::IRotationAPI& api,
                                     const CombatState& state) const
     {
@@ -2997,7 +3673,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.2.12 spell="
+        out << "DBG_CAST v2.3.2 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -3014,7 +3690,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.2.12 name="
+        out << "NO_TARGET v2.3.2 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -3032,7 +3708,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.2.12"
+        out << prefix << " v2.3.2"
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -3052,7 +3728,7 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.2.12 target="
+        out << "DBG v2.3.2 target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
@@ -3066,6 +3742,13 @@ private:
             << " mode=" << debug_mode_name(state)
             << " enemies=" << state.enemies << '/' << state.meaningful_enemies
             << " aoe=" << debug_bool(state.use_aoe_list)
+            << " np=" << state.np_raw << '/' << state.np_damageable
+            << '/' << state.np_hostile_flags << '/' << state.np_dummy
+            << '/' << state.np_effective
+            << " npc=" << state.np_count_api << '/' << state.np_count_any
+            << " rods=" << state.lightning_rods << '/' << state.enemies
+            << " ebbuff=" << debug_elemental_blast_buff(api, state)
+            << " eq=" << earthquake_gate_debug(api, state)
             << " mael=" << state.maelstrom << '/' << state.maelstrom_max
             << " ttd=" << std::setprecision(1) << state.fight_ttd
             << " packhp=" << state.pack_health_percent
@@ -3073,6 +3756,7 @@ private:
             << '/' << std::setprecision(1) << state.pack_stable_for
             << " melee=" << state.melee_ratio
             << " eqsafe=" << debug_bool(state.earthquake_safe)
+            << " eqgate=" << (state.talent_elemental_blast ? "eb3" : "eq3")
             << " forecast=" << state.forecast_builder_gain
             << '/' << debug_bool(state.forecast_overcap)
             << " event=" << state.encounter_danger_eta
