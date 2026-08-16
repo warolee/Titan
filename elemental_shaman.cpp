@@ -135,9 +135,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.2.5: duplicate-CD settle, strict Major-CD trinkets, player-facing settings";
+        return "Midnight Season 2 Elemental Shaman v2.2.6: saved trinket-mode compatibility, cooldown-toggle diagnostic";
     }
-    RotationVersion get_version() const override { return {2, 2, 5}; }
+    RotationVersion get_version() const override { return {2, 2, 6}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -149,6 +149,9 @@ public:
     // what reads the user's saved value during play.
     SettingsSchema get_settings_schema() const override {
         SettingsSchema schema;
+
+        // Titan persists enum settings by option index, not EnumOption.value.
+        // Never reorder existing options; append new choices at the end only.
 
         SettingGroup automation;
         automation.id = "automation";
@@ -186,18 +189,18 @@ public:
             .add_enum_option(2, "Boss Only", "Reserve major cooldowns for bosses and training dummies.")
             .set_group("cooldowns"));
         schema.add(SettingDefinition::make_enum("trinket_1_mode", "Trinket 1", 2)
+            .add_enum_option(0, "Disabled", "Never use this trinket automatically.")
             .add_enum_option(1, "Smart", "Automatically choose between immediate use and burst alignment.")
             .add_enum_option(2, "With Major CDs", "Use only inside the Ascendance burst package.")
-            .add_enum_option(4, "On Cooldown", "Use whenever ready while cooldown automation is enabled.")
             .add_enum_option(3, "Boss Only", "Use only on bosses and training dummies.")
-            .add_enum_option(0, "Disabled", "Never use this trinket automatically.")
+            .add_enum_option(4, "On Cooldown", "Use whenever ready while cooldown automation is enabled.")
             .set_group("cooldowns"));
         schema.add(SettingDefinition::make_enum("trinket_2_mode", "Trinket 2", 2)
+            .add_enum_option(0, "Disabled", "Never use this trinket automatically.")
             .add_enum_option(1, "Smart", "Automatically choose between immediate use and burst alignment.")
             .add_enum_option(2, "With Major CDs", "Use only inside the Ascendance burst package.")
-            .add_enum_option(4, "On Cooldown", "Use whenever ready while cooldown automation is enabled.")
             .add_enum_option(3, "Boss Only", "Use only on bosses and training dummies.")
-            .add_enum_option(0, "Disabled", "Never use this trinket automatically.")
+            .add_enum_option(4, "On Cooldown", "Use whenever ready while cooldown automation is enabled.")
             .set_group("cooldowns"));
         schema.add(SettingDefinition::make_bool("automatic_prepull", "Automatic Prepull", true)
             .set_description("Uses Titan's pull timer to prepare Stormkeeper and Lava Burst.")
@@ -341,6 +344,10 @@ public:
     // Keep this list short: Titan already shows Pause, AOE, Cooldowns, and
     // Interrupt. Extra buttons should be things you click during a pull.
     // Purge and Capacitor stun are settings, not overlay buttons.
+    //
+    // Titan owns live and persisted toggle state. default_enabled is only the
+    // first-load fallback; later profile reloads keep the client's last values.
+    // Names and declaration order are a compatibility contract.
     std::vector<CustomToggle> get_custom_toggles() const override {
         return {
             {"Defensives", true},
@@ -414,6 +421,9 @@ public:
         last_logged_hero_tree_ = HeroTree::Unknown;
         hero_tree_was_logged_ = false;
         last_debug_log_time_ = -999.0;
+        last_cd_toggle_diag_time_ = -999.0;
+        last_dup_block_key_ = 0;
+        last_dup_block_window_end_ = -999.0;
         last_pack_enemy_count_ = 0;
         last_pack_average_range_ = 0.0;
         last_pack_snapshot_time_ = -999.0;
@@ -440,10 +450,11 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.2.5 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.2.6 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
+        maybe_log_cooldown_toggle_state(context);
     }
 
     // PREPULL ORDER:
@@ -829,6 +840,9 @@ private:
     bool debug_diagnostics_ = false;
     double debug_interval_ = 2.0;
     double last_debug_log_time_ = -999.0;
+    double last_cd_toggle_diag_time_ = -999.0;
+    uint32_t last_dup_block_key_ = 0;
+    double last_dup_block_window_end_ = -999.0;
     bool automatic_target_recovery_ = true;
     bool automatic_prepull_ = true;
     int survival_profile_ = 1;
@@ -1086,20 +1100,35 @@ private:
         return last_success_time > 0.0 && (now - last_success_time) < settle_window;
     }
 
-    void note_duplicate_prevented() {
-        if (telemetry_combat_active_) ++telemetry_.duplicate_dispatches_prevented;
+    void note_duplicate_prevented(uint32_t key, double window_end) {
+        if (!telemetry_combat_active_) return;
+        if (key == last_dup_block_key_ &&
+            std::abs(window_end - last_dup_block_window_end_) < 0.05)
+        {
+            return;
+        }
+        last_dup_block_key_ = key;
+        last_dup_block_window_end_ = window_end;
+        ++telemetry_.duplicate_dispatches_prevented;
     }
 
-    bool setup_action_blocked(double pending_until,
+    bool setup_action_blocked(uint32_t key,
+                              double pending_until,
                               double last_success_time,
                               double settle_window,
                               double now,
                               bool otherwise_eligible)
     {
-        const bool blocked = still_pending(pending_until, now) ||
-            recently_succeeded(last_success_time, settle_window, now);
-        if (blocked && otherwise_eligible) note_duplicate_prevented();
-        return blocked;
+        const bool pending = still_pending(pending_until, now);
+        const bool settling = recently_succeeded(last_success_time, settle_window, now);
+        if (!(pending || settling)) return false;
+        if (otherwise_eligible) {
+            const double window_end = pending
+                ? pending_until
+                : last_success_time + settle_window;
+            note_duplicate_prevented(key, window_end);
+        }
+        return true;
     }
 
     RotationAction dispatch_player_setup(const rotation_api::IRotationAPI& api,
@@ -1111,7 +1140,7 @@ private:
     {
         const double now = api.get_game_time();
         const bool eligible = can_cast(api, spell_id);
-        if (setup_action_blocked(pending_until, last_success_time, settle_window, now, eligible)) {
+        if (setup_action_blocked(spell_id, pending_until, last_success_time, settle_window, now, eligible)) {
             return no_action("Setup settling");
         }
         if (!eligible) return no_action("Unavailable");
@@ -1125,8 +1154,8 @@ private:
     {
         const double now = api.get_game_time();
         const bool eligible = can_cast(api, spellbook_.voltaic_blaze);
-        if (setup_action_blocked(voltaic_setup_pending_until_, last_voltaic_blaze_success_time_,
-                kVoltaicSetupSettle, now, eligible))
+        if (setup_action_blocked(spellbook_.voltaic_blaze, voltaic_setup_pending_until_,
+                last_voltaic_blaze_success_time_, kVoltaicSetupSettle, now, eligible))
         {
             return no_action("Voltaic setup settling");
         }
@@ -1638,7 +1667,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.2.5 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.2.6 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -2633,6 +2662,16 @@ private:
             projected_cooldown_uses(state.fight_ttd, 0.0, base);
     }
 
+    void maybe_log_cooldown_toggle_state(const RotationContext& context) {
+        const auto& api = context.api();
+        if (!api.are_cooldowns_enabled()) return;
+        if (api.is_toggle_enabled("Mini CDs") || api.is_toggle_enabled("Major CDs")) return;
+        const double now = api.get_game_time();
+        if ((now - last_cd_toggle_diag_time_) < 8.0) return;
+        last_cd_toggle_diag_time_ = now;
+        context.log("Cooldown automation inactive: Mini CDs and Major CDs are both OFF");
+    }
+
     // Titan's Cooldowns toggle is the master gate. Mini and Major then split
     // Stormkeeper/Swiftness from Ascendance, racials, and aligned trinkets.
     bool damage_cooldown_master_enabled(const rotation_api::IRotationAPI& api) const {
@@ -2760,7 +2799,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.2.5 spell="
+        out << "DBG_CAST v2.2.6 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -2777,7 +2816,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.2.5 name="
+        out << "NO_TARGET v2.2.6 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -2795,7 +2834,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.2.5"
+        out << prefix << " v2.2.6"
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -2815,7 +2854,7 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.2.5 target="
+        out << "DBG v2.2.6 target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
@@ -2970,7 +3009,8 @@ private:
         const double now = api.get_game_time();
         double& pending_until = slot == 1 ? trinket_1_pending_until_ : trinket_2_pending_until_;
         const double last_success = slot == 1 ? last_trinket_1_success_time_ : last_trinket_2_success_time_;
-        if (setup_action_blocked(pending_until, last_success, kTrinketSettle, now, true)) {
+        if (setup_action_blocked(0x80000000u + static_cast<uint32_t>(slot),
+                pending_until, last_success, kTrinketSettle, now, true)) {
             return no_action("Trinket settling");
         }
 
@@ -3133,8 +3173,8 @@ private:
 
         const double now = api.get_game_time();
         const bool ascendance_eligible = can_cast(api, spellbook_.ascendance);
-        if (setup_action_blocked(ascendance_pending_until_, last_ascendance_success_time_,
-                kAscendanceSettle, now, ascendance_eligible))
+        if (setup_action_blocked(spellbook_.ascendance, ascendance_pending_until_,
+                last_ascendance_success_time_, kAscendanceSettle, now, ascendance_eligible))
         {
             return no_action("Ascendance settling");
         }
