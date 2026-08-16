@@ -135,9 +135,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.2.8: dummy full-APL restore, cooldown attempt latch";
+        return "Midnight Season 2 Elemental Shaman v2.2.12: current-target hostility continuity";
     }
-    RotationVersion get_version() const override { return {2, 2, 8}; }
+    RotationVersion get_version() const override { return {2, 2, 12}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -402,6 +402,7 @@ public:
         last_ancestral_swiftness_dispatch_time_ = -999.0;
         last_ascendance_dispatch_time_ = -999.0;
         last_voltaic_setup_dispatch_time_ = -999.0;
+        last_input_dispatch_time_ = -999.0;
         last_prepull_lava_burst_generation_ = 0;
         last_trinket_1_attempt_time_ = -999.0;
         last_trinket_2_attempt_time_ = -999.0;
@@ -426,6 +427,15 @@ public:
         hero_tree_was_logged_ = false;
         last_debug_log_time_ = -999.0;
         last_cd_toggle_diag_time_ = -999.0;
+        last_recovery_debug_time_ = -999.0;
+        last_range_fallback_debug_time_ = -999.0;
+        last_target_continuity_debug_time_ = -999.0;
+        range_fallback_message_.clear();
+        target_continuity_message_.clear();
+        current_snapshot_target_guid_.clear();
+        current_snapshot_target_range_ = 0.0;
+        current_snapshot_target_range_valid_ = false;
+        current_snapshot_target_hostile_ = false;
         last_dup_block_key_ = 0;
         last_dup_block_window_end_ = -999.0;
         last_pack_enemy_count_ = 0;
@@ -454,7 +464,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.2.8 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.2.12 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -555,6 +565,18 @@ public:
             return no_action(debug_diagnostics_ ? debug_cast_snapshot(api) : "Casting");
         }
 
+        // Titan can keep a stale cast/GCD snapshot for ~100-170ms after a
+        // button is sent. Wait out the remainder of the 0.20s window so the
+        // next tick can see the resulting state. This is not a GCD and does
+        // not throttle the rotation after the snapshot catches up.
+        {
+            const double remaining =
+                kInputSettleWindow - (api.get_game_time() - last_input_dispatch_time_);
+            if (remaining > 0.0) {
+                return wait_action(remaining * 1000.0, "Input settle");
+            }
+        }
+
         // Take one consistent snapshot of enemies, resources, talents, and buffs.
         CombatState state = build_state(api);
         last_global_lock_ = {state.global_lock, state.gcd_desync, state.global_lock_remaining};
@@ -562,6 +584,14 @@ public:
         if (!trinket_break_message_.empty()) {
             ctx.log(trinket_break_message_);
             trinket_break_message_.clear();
+        }
+        if (!range_fallback_message_.empty()) {
+            ctx.log(range_fallback_message_);
+            range_fallback_message_.clear();
+        }
+        if (!target_continuity_message_.empty()) {
+            ctx.log(target_continuity_message_);
+            target_continuity_message_.clear();
         }
         if (debug_diagnostics_) {
             const double now = api.get_game_time();
@@ -595,15 +625,17 @@ public:
             return action;
         }
 
-        // Combat recovery Tabs only while already in combat. Dummies, friendlies,
-        // empty out-of-combat selection, and mounted states are left alone.
-        if (RotationAction action = combat_recovery_action(api, state); !action.is_none()) {
+        // Combat recovery Tabs only while already in combat. Dummies, mounted,
+        // paused, and out-of-combat friendlies are left alone. In combat, a
+        // friendly/empty/dead target recovers immediately when a healthy
+        // hostile alternative exists.
+        if (RotationAction action = combat_recovery_action(ctx, state); !action.is_none()) {
             return action;
         }
 
         // Never invent a target. Dummy parks stay on the selected dummy through
         // 0% regen; a friendly or empty target is left alone.
-        if (!can_damage_unit(api, state.target)) {
+        if (!can_damage_action_target(api, state.target)) {
             return no_action(debug_diagnostics_
                 ? debug_target_failure(api, state)
                 : "No valid enemy target");
@@ -817,6 +849,7 @@ private:
     double last_ancestral_swiftness_dispatch_time_ = -999.0;
     double last_ascendance_dispatch_time_ = -999.0;
     double last_voltaic_setup_dispatch_time_ = -999.0;
+    double last_input_dispatch_time_ = -999.0;
     uint64_t last_prepull_lava_burst_generation_ = 0;
 
     // Per-combat exact-opener state. A mechanic or unavailable spell may skip a
@@ -850,6 +883,15 @@ private:
     double debug_interval_ = 2.0;
     double last_debug_log_time_ = -999.0;
     double last_cd_toggle_diag_time_ = -999.0;
+    double last_recovery_debug_time_ = -999.0;
+    double last_range_fallback_debug_time_ = -999.0;
+    double last_target_continuity_debug_time_ = -999.0;
+    std::string range_fallback_message_;
+    std::string target_continuity_message_;
+    std::string current_snapshot_target_guid_;
+    double current_snapshot_target_range_ = 0.0;
+    bool current_snapshot_target_range_valid_ = false;
+    bool current_snapshot_target_hostile_ = false;
     uint32_t last_dup_block_key_ = 0;
     double last_dup_block_window_end_ = -999.0;
     bool automatic_target_recovery_ = true;
@@ -1092,8 +1134,11 @@ private:
     static constexpr double kAscendanceAttempt = 2.0;
     static constexpr double kTrinketAttempt = 1.5;
     static constexpr double kVoltaicSetupAttempt = 1.0;
+    static constexpr double kInputSettleWindow = 0.20;
     static constexpr double kTabRateLimit = 0.75;
     static constexpr double kUnreachableDwell = 0.60;
+    static constexpr double kCloseRangeFallback = 10.0;
+    static constexpr double kHostileGuidGrace = 0.35;
     static constexpr double kSharedLockMax = 1.50;
     static constexpr double kSharedLockCluster = 0.25;
 
@@ -1116,6 +1161,10 @@ private:
 
     static bool recently_attempted(double last_dispatch_time, double attempt_window, double now) {
         return last_dispatch_time > 0.0 && (now - last_dispatch_time) < attempt_window;
+    }
+
+    void note_input_dispatch(const rotation_api::IRotationAPI& api) {
+        last_input_dispatch_time_ = api.get_game_time();
     }
 
     void note_duplicate_prevented(uint32_t key, double window_end) {
@@ -1172,6 +1221,7 @@ private:
         if (!eligible) return no_action("Unavailable");
         pending_until = now + kSetupPendingWindow;
         last_dispatch_time = now;
+        last_input_dispatch_time_ = now;
         return spell(spell_id, "player", reason);
     }
 
@@ -1192,6 +1242,7 @@ private:
         if (!action.is_none()) {
             voltaic_setup_pending_until_ = now + kVoltaicSetupPendingWindow;
             last_voltaic_setup_dispatch_time_ = now;
+            last_input_dispatch_time_ = now;
         }
         return action;
     }
@@ -1247,7 +1298,7 @@ private:
     }
 
     bool representative_damage_in_range(const rotation_api::IRotationAPI& api,
-                                        const std::string& unit) const
+                                        const std::string& unit)
     {
         if (unit.empty()) return false;
         const uint32_t ids[] = {
@@ -1262,14 +1313,15 @@ private:
         for (uint32_t id : ids) {
             if (id == 0) continue;
             ++known;
-            if (api.is_spell_in_range(id, unit)) ++in_range;
+            if (damage_spell_in_range(api, id, unit, false)) ++in_range;
         }
         return known == 0 ? true : in_range > 0;
     }
 
-    RotationAction combat_recovery_action(const rotation_api::IRotationAPI& api,
+    RotationAction combat_recovery_action(const RotationContext& ctx,
                                           const CombatState& state)
     {
+        const auto& api = ctx.api();
         if (!automatic_target_recovery_) return no_action("Recovery disabled");
         if (api.is_mounted() || api.is_paused() || !api.is_in_combat_lockdown()) {
             target_unreachable_since_ = -999.0;
@@ -1283,13 +1335,10 @@ private:
         }
 
         const bool exists = api.unit_exists("target");
-        const bool friendly = exists && !can_damage_unit(api, "target") &&
-            !api.unit_is_dead("target");
-        if (friendly) {
-            target_unreachable_since_ = -999.0;
-            recovery_watch_guid_.clear();
-            return no_action("Friendly target left alone");
-        }
+        const bool dead = exists && api.unit_is_dead("target");
+        const bool hostile = exists && current_target_is_hostile(api);
+        const bool friendly_or_invalid = exists && !hostile && !dead;
+        const bool dead_or_empty = !exists || dead;
 
         const std::string guid = exists ? api.get_unit_guid("target") : std::string{};
         if (guid != recovery_watch_guid_) {
@@ -1297,10 +1346,8 @@ private:
             target_unreachable_since_ = -999.0;
         }
 
-        const bool dead_or_empty = !exists || api.unit_is_dead("target");
-        const bool hostile_current = exists && can_damage_unit(api, "target");
         bool unreachable = false;
-        if (hostile_current && !dead_or_empty) {
+        if (hostile && !dead) {
             if (representative_damage_in_range(api, "target")) {
                 target_unreachable_since_ = -999.0;
             } else {
@@ -1308,14 +1355,29 @@ private:
                 if (target_unreachable_since_ < 0.0) target_unreachable_since_ = now;
                 unreachable = (now - target_unreachable_since_) >= kUnreachableDwell;
             }
+        } else {
+            target_unreachable_since_ = -999.0;
         }
 
-        const bool needs_recovery = dead_or_empty || unreachable;
-        if (!needs_recovery || !state.healthy_hostile_alternative) {
+        const bool immediate_recovery = (friendly_or_invalid || dead_or_empty) &&
+            state.healthy_hostile_alternative;
+        const bool needs_recovery = immediate_recovery ||
+            (unreachable && state.healthy_hostile_alternative);
+        if (!needs_recovery) {
             return no_action("No combat recovery");
         }
 
+        const char* recovery_reason = "unreachable";
+        if (friendly_or_invalid) recovery_reason = "friendly";
+        else if (!exists) recovery_reason = "empty";
+        else if (dead) recovery_reason = "dead";
+
         const double now = api.get_game_time();
+        if (debug_diagnostics_ && (now - last_recovery_debug_time_) >= kTabRateLimit) {
+            ctx.log(std::string("TARGET_RECOVERY ") + recovery_reason);
+            last_recovery_debug_time_ = now;
+        }
+
         if ((now - last_retarget_attempt_time_) < kTabRateLimit) {
             return no_action("Tab rate limited");
         }
@@ -1352,27 +1414,68 @@ private:
         return false;
     }
 
-    // Current-target validation is intentionally stricter than nameplate
-    // enumeration. Titan can retain a friendly target after a target swap; a
-    // short same-GUID grace absorbs one settling snapshot without ever treating
-    // a new friendly unit (including the player) as a damage target.
-    std::string current_damage_target(const rotation_api::IRotationAPI& api) {
-        if (!can_damage_unit(api, "target")) return {};
-        const double now = api.get_game_time();
+    // Titan's enemy/attack flags for the current target can read false for a
+    // snapshot right after a target swap. Hostility therefore accepts three
+    // independent proofs, in descending strength. Nameplate proof requires the
+    // exact selected GUID to appear in this tick's strict hostile scan, so a
+    // friendly unit or the player can never qualify.
+    enum class HostileProof { None, Dummy, Flags, Nameplate, RecentGuid };
+
+    HostileProof current_target_hostile_proof(const rotation_api::IRotationAPI& api) const {
+        if (!api.unit_exists("target")) return HostileProof::None;
+        if (unit_looks_like_dummy(api, "target")) return HostileProof::Dummy;
+        if (api.unit_is_dead("target")) return HostileProof::None;
+        if (api.unit_is_enemy("target") || api.unit_can_attack("target")) {
+            return HostileProof::Flags;
+        }
         const std::string guid = api.get_unit_guid("target");
-        if (api.unit_is_training_dummy("target") || unit_looks_like_dummy(api, "target") ||
-            api.unit_is_enemy("target") || api.unit_can_attack("target"))
-        {
-            last_hostile_target_guid_ = guid;
-            last_hostile_target_seen_time_ = now;
-            return "target";
+        if (guid.empty()) return HostileProof::None;
+        if (current_snapshot_target_hostile_ && guid == current_snapshot_target_guid_) {
+            return HostileProof::Nameplate;
         }
-        if (!guid.empty() && guid == last_hostile_target_guid_ &&
-            (now - last_hostile_target_seen_time_) <= 0.35)
+        if (guid == last_hostile_target_guid_ &&
+            (api.get_game_time() - last_hostile_target_seen_time_) <= kHostileGuidGrace)
         {
-            return "target";
+            return HostileProof::RecentGuid;
         }
-        return {};
+        return HostileProof::None;
+    }
+
+    bool current_target_is_hostile(const rotation_api::IRotationAPI& api) const {
+        return current_target_hostile_proof(api) != HostileProof::None;
+    }
+
+    // Only the current target gets the resilient path. Nameplate enumeration
+    // and every other unit keep the strict guard.
+    bool can_damage_action_target(const rotation_api::IRotationAPI& api,
+                                  const std::string& unit) const
+    {
+        if (unit != "target") return can_damage_unit(api, unit);
+        return current_target_is_hostile(api);
+    }
+
+    void note_target_continuity(const rotation_api::IRotationAPI& api, const char* proof) {
+        if (!debug_diagnostics_) return;
+        const double now = api.get_game_time();
+        if ((now - last_target_continuity_debug_time_) < 0.75) return;
+        last_target_continuity_debug_time_ = now;
+        target_continuity_message_ = std::string("TARGET_CONTINUITY ") + proof +
+            " target=" + api.get_unit_name("target");
+    }
+
+    std::string current_damage_target(const rotation_api::IRotationAPI& api) {
+        const HostileProof proof = current_target_hostile_proof(api);
+        if (proof == HostileProof::None) return {};
+
+        // Flag and nameplate proofs are real confirmations, so they refresh the
+        // same-GUID grace. The grace itself must never extend itself.
+        if (proof != HostileProof::RecentGuid) {
+            last_hostile_target_guid_ = api.get_unit_guid("target");
+            last_hostile_target_seen_time_ = api.get_game_time();
+        }
+        if (proof == HostileProof::Nameplate) note_target_continuity(api, "nameplate");
+        else if (proof == HostileProof::RecentGuid) note_target_continuity(api, "recent_guid");
+        return "target";
     }
 
     // Equivalent friendly-unit guard used for curse cleansing/self-healing.
@@ -1696,7 +1799,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.2.8 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.2.12 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -1762,7 +1865,8 @@ private:
             if (enemy.unit_token.empty() || !can_damage_unit(api, enemy.unit_token)) continue;
             if (has_debuff_name(api, enemy.unit_token, name, true)) ++count;
         }
-        if (count == 0 && can_damage_unit(api, "target") && has_debuff_name(api, "target", name, true)) {
+        if (count == 0 && current_target_is_hostile(api) &&
+            has_debuff_name(api, "target", name, true)) {
             count = 1;
         }
         return count;
@@ -1777,7 +1881,9 @@ private:
                                          bool allow_spread) const
     {
         (void)allow_spread;
-        if (can_damage_unit(api, state.target) && flame_shock_refreshable(api, state.target)) {
+        if (can_damage_action_target(api, state.target) &&
+            flame_shock_refreshable(api, state.target))
+        {
             return state.target;
         }
         return "";
@@ -1790,7 +1896,7 @@ private:
     std::string lowest_flame_shock_target(const rotation_api::IRotationAPI& api,
                                           const CombatState& state) const
     {
-        if (!can_damage_unit(api, state.target) ||
+        if (!can_damage_action_target(api, state.target) ||
             !has_flame_shock(api, state.target)) return "";
         if (spellbook_.flame_shock != 0 &&
             !api.is_spell_in_range(spellbook_.flame_shock, state.target)) return "";
@@ -1833,12 +1939,20 @@ private:
         state.mythic_plus_level = state.is_mplus
             ? static_cast<int>(api.get_mythic_plus_level()) : 0;
         state.hero_tree = detect_hero_tree(api);
-        // Keep the user's target when valid. Titan's secure foreground executor
-        // does not translate arbitrary hostile nameplate tokens into target
-        // changes, so the rotation never invents an executable fallback target.
-        state.target = current_damage_target(api);
+        // The raw selection is recorded before validation so the hostile
+        // nameplate scan below can vouch for a target whose enemy/attack flags
+        // have not settled yet. Titan's secure foreground executor does not
+        // translate arbitrary nameplate tokens into target changes, so the
+        // rotation still never invents an executable fallback target.
+        const std::string raw_target_guid = api.unit_exists("target")
+            ? api.get_unit_guid("target") : std::string{};
 
         const auto nameplates = api.get_nameplates_in_range(40.0, true, false);
+
+        current_snapshot_target_guid_ = raw_target_guid;
+        current_snapshot_target_range_ = 0.0;
+        current_snapshot_target_range_valid_ = false;
+        current_snapshot_target_hostile_ = false;
 
         // Build a health-aware pull model. Enemies about to die remain valid
         // damage targets but stop inflating the smart cooldown pull size.
@@ -1869,12 +1983,18 @@ private:
             const bool enough_hp = hp_percent >= mplus_meaningful_enemy_hp_;
             if (enough_ttd && enough_hp) ++state.meaningful_enemies;
 
-            const std::string target_guid = state.target.empty()
-                ? std::string{} : api.get_unit_guid(state.target);
             const std::string enemy_guid = api.get_unit_guid(unit);
-            const bool different_unit = target_guid.empty() || enemy_guid.empty() ||
-                enemy_guid != target_guid;
-            if (different_unit && hp_percent > 0.1) {
+            const bool is_current_target = !raw_target_guid.empty() &&
+                ((!enemy.guid.empty() && enemy.guid == raw_target_guid) ||
+                 (!enemy_guid.empty() && enemy_guid == raw_target_guid));
+            if (is_current_target) {
+                current_snapshot_target_hostile_ = true;
+                if (enemy.range.has_value()) {
+                    current_snapshot_target_range_ = enemy.range.value();
+                    current_snapshot_target_range_valid_ = true;
+                }
+            }
+            if (!is_current_target && hp_percent > 0.1) {
                 state.healthy_hostile_alternative = true;
             }
 
@@ -1892,6 +2012,10 @@ private:
                 }
             }
         }
+
+        // Hostile-nameplate evidence for this tick is complete, so the current
+        // selection can finally be validated against it.
+        state.target = current_damage_target(api);
 
         if (!state.target.empty()) {
             state.enemies = std::max(1, state.enemies);
@@ -2056,14 +2180,49 @@ private:
     // -------------------------------------------------------------------------
     // Creates a hostile-target action only when target, spell, LOS, and range
     // are valid. "reason" is the label visible in rotation debugging.
+    bool damage_spell_in_range(const rotation_api::IRotationAPI& api,
+                               uint32_t spell_id,
+                               const std::string& unit,
+                               bool log_fallback)
+    {
+        if (api.is_spell_in_range(spell_id, unit)) return true;
+        if (unit != "target") return false;
+        if (!api.unit_exists("target") || !current_target_is_hostile(api)) return false;
+        if (api.unit_is_dead("target") && !unit_looks_like_dummy(api, "target")) return false;
+        if (!current_snapshot_target_range_valid_) return false;
+        const std::string guid = api.get_unit_guid("target");
+        if (guid.empty() || guid != current_snapshot_target_guid_) return false;
+        if (current_snapshot_target_range_ > kCloseRangeFallback) return false;
+        if (log_fallback) note_range_fallback(api, spell_id);
+        return true;
+    }
+
+    void note_range_fallback(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
+        if (!debug_diagnostics_) return;
+        const double now = api.get_game_time();
+        if ((now - last_range_fallback_debug_time_) < 0.75) return;
+        last_range_fallback_debug_time_ = now;
+        std::ostringstream out;
+        out << "RANGE_FALLBACK spell=" << spell_id
+            << " target=" << api.get_unit_name("target")
+            << " range=" << std::fixed << std::setprecision(1)
+            << current_snapshot_target_range_;
+        range_fallback_message_ = out.str();
+    }
+
     RotationAction cast_damage(const rotation_api::IRotationAPI& api,
                                uint32_t spell_id,
                                const std::string& unit,
                                const std::string& reason,
                                bool check_range = true)
     {
-        if (!can_damage_unit(api, unit) || !can_cast(api, spell_id)) return no_action("Unavailable");
-        if (check_range && !api.is_spell_in_range(spell_id, unit)) return no_action("Out of range");
+        if (!can_damage_action_target(api, unit) || !can_cast(api, spell_id)) {
+            return no_action("Unavailable");
+        }
+        if (check_range && !damage_spell_in_range(api, spell_id, unit, true)) {
+            return no_action("Out of range");
+        }
+        note_input_dispatch(api);
         return spell(spell_id, unit, reason);
     }
 
@@ -2073,6 +2232,7 @@ private:
                              const std::string& reason)
     {
         if (!can_cast(api, spell_id)) return no_action("Unavailable");
+        note_input_dispatch(api);
         return spell(spell_id, "player", reason);
     }
 
@@ -2127,6 +2287,7 @@ private:
             return cast_damage(api, spellbook_.earthquake, state.target,
                 reason + " Earthquake on target");
         }
+        note_input_dispatch(api);
         return macro(elemental_ids::EARTHQUAKE_CURSOR_MACRO,
             reason + " Earthquake @cursor compatibility fallback");
     }
@@ -2836,7 +2997,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.2.8 spell="
+        out << "DBG_CAST v2.2.12 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -2853,7 +3014,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.2.8 name="
+        out << "NO_TARGET v2.2.12 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -2871,7 +3032,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.2.8"
+        out << prefix << " v2.2.12"
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -2891,7 +3052,7 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.2.8 target="
+        out << "DBG v2.2.12 target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
@@ -3069,6 +3230,7 @@ private:
         if (slot == 1) last_trinket_1_attempt_time_ = now;
         else last_trinket_2_attempt_time_ = now;
         pending_until = now + kSetupPendingWindow;
+        last_input_dispatch_time_ = now;
 
         const std::string note = reason + " - slot " + std::to_string(slot) +
             " " + equipped->item_name;
@@ -3539,8 +3701,9 @@ private:
             }
         }
 
-        // ST 14: Chain Lightning is the filler at exactly two targets.
-        if (state.enemies == 2 && can_cast(api, spellbook_.chain_lightning)) {
+        // ST 14: Chain Lightning is the filler at exactly two meaningful targets.
+        if (state.enemies == 2 && state.meaningful_enemies >= 2 &&
+            can_cast(api, spellbook_.chain_lightning)) {
             if (RotationAction action = cast_damage(api, spellbook_.chain_lightning, state.target,
                     "Two-target Chain Lightning"); !action.is_none())
             {
