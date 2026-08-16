@@ -135,9 +135,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.2.6: saved trinket-mode compatibility, cooldown-toggle diagnostic";
+        return "Midnight Season 2 Elemental Shaman v2.2.8: dummy full-APL restore, cooldown attempt latch";
     }
-    RotationVersion get_version() const override { return {2, 2, 6}; }
+    RotationVersion get_version() const override { return {2, 2, 8}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -398,6 +398,10 @@ public:
         last_ascendance_success_time_ = -999.0;
         last_trinket_1_success_time_ = -999.0;
         last_trinket_2_success_time_ = -999.0;
+        last_stormkeeper_dispatch_time_ = -999.0;
+        last_ancestral_swiftness_dispatch_time_ = -999.0;
+        last_ascendance_dispatch_time_ = -999.0;
+        last_voltaic_setup_dispatch_time_ = -999.0;
         last_prepull_lava_burst_generation_ = 0;
         last_trinket_1_attempt_time_ = -999.0;
         last_trinket_2_attempt_time_ = -999.0;
@@ -450,7 +454,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.2.6 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.2.8 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -474,6 +478,7 @@ public:
             if (RotationAction action = dispatch_player_setup(
                     api, spellbook_.stormkeeper, stormkeeper_pending_until_,
                     last_stormkeeper_success_time_, kStormkeeperSettle,
+                    last_stormkeeper_dispatch_time_, kStormkeeperAttempt,
                     "Prepull Stormkeeper"); !action.is_none())
             {
                 return action;
@@ -511,8 +516,8 @@ public:
 
     // Out of combat only maintains buffs, unless a training dummy is still
     // selected. Dummy parks drop combat at 0% HP, then regenerate; keep the
-    // damage list running so a timed parse does not stall. Ordinary hostiles
-    // are never pulled automatically.
+    // complete rotation running so dummy testing and timed parses do not stall.
+    // Ordinary hostiles are never pulled automatically.
     RotationAction get_out_of_combat_action(const RotationContext& ctx) override {
         const auto& api = ctx.api();
         refresh_spellbook(api);
@@ -808,6 +813,10 @@ private:
     double last_ascendance_success_time_ = -999.0;
     double last_trinket_1_success_time_ = -999.0;
     double last_trinket_2_success_time_ = -999.0;
+    double last_stormkeeper_dispatch_time_ = -999.0;
+    double last_ancestral_swiftness_dispatch_time_ = -999.0;
+    double last_ascendance_dispatch_time_ = -999.0;
+    double last_voltaic_setup_dispatch_time_ = -999.0;
     uint64_t last_prepull_lava_burst_generation_ = 0;
 
     // Per-combat exact-opener state. A mechanic or unavailable spell may skip a
@@ -1078,6 +1087,11 @@ private:
     static constexpr double kAscendanceSettle = 2.0;
     static constexpr double kTrinketSettle = 1.25;
     static constexpr double kVoltaicSetupSettle = 0.75;
+    static constexpr double kStormkeeperAttempt = 2.5;
+    static constexpr double kAncestralSwiftnessAttempt = 1.5;
+    static constexpr double kAscendanceAttempt = 2.0;
+    static constexpr double kTrinketAttempt = 1.5;
+    static constexpr double kVoltaicSetupAttempt = 1.0;
     static constexpr double kTabRateLimit = 0.75;
     static constexpr double kUnreachableDwell = 0.60;
     static constexpr double kSharedLockMax = 1.50;
@@ -1100,6 +1114,10 @@ private:
         return last_success_time > 0.0 && (now - last_success_time) < settle_window;
     }
 
+    static bool recently_attempted(double last_dispatch_time, double attempt_window, double now) {
+        return last_dispatch_time > 0.0 && (now - last_dispatch_time) < attempt_window;
+    }
+
     void note_duplicate_prevented(uint32_t key, double window_end) {
         if (!telemetry_combat_active_) return;
         if (key == last_dup_block_key_ &&
@@ -1116,16 +1134,20 @@ private:
                               double pending_until,
                               double last_success_time,
                               double settle_window,
+                              double last_dispatch_time,
+                              double attempt_window,
                               double now,
                               bool otherwise_eligible)
     {
+        const bool attempted = recently_attempted(last_dispatch_time, attempt_window, now);
         const bool pending = still_pending(pending_until, now);
         const bool settling = recently_succeeded(last_success_time, settle_window, now);
-        if (!(pending || settling)) return false;
+        if (!(attempted || pending || settling)) return false;
         if (otherwise_eligible) {
-            const double window_end = pending
-                ? pending_until
-                : last_success_time + settle_window;
+            double window_end = now;
+            if (attempted) window_end = std::max(window_end, last_dispatch_time + attempt_window);
+            if (pending) window_end = std::max(window_end, pending_until);
+            if (settling) window_end = std::max(window_end, last_success_time + settle_window);
             note_duplicate_prevented(key, window_end);
         }
         return true;
@@ -1136,15 +1158,20 @@ private:
                                          double& pending_until,
                                          double last_success_time,
                                          double settle_window,
+                                         double& last_dispatch_time,
+                                         double attempt_window,
                                          const std::string& reason)
     {
         const double now = api.get_game_time();
         const bool eligible = can_cast(api, spell_id);
-        if (setup_action_blocked(spell_id, pending_until, last_success_time, settle_window, now, eligible)) {
+        if (setup_action_blocked(spell_id, pending_until, last_success_time, settle_window,
+                last_dispatch_time, attempt_window, now, eligible))
+        {
             return no_action("Setup settling");
         }
         if (!eligible) return no_action("Unavailable");
         pending_until = now + kSetupPendingWindow;
+        last_dispatch_time = now;
         return spell(spell_id, "player", reason);
     }
 
@@ -1155,7 +1182,8 @@ private:
         const double now = api.get_game_time();
         const bool eligible = can_cast(api, spellbook_.voltaic_blaze);
         if (setup_action_blocked(spellbook_.voltaic_blaze, voltaic_setup_pending_until_,
-                last_voltaic_blaze_success_time_, kVoltaicSetupSettle, now, eligible))
+                last_voltaic_blaze_success_time_, kVoltaicSetupSettle,
+                last_voltaic_setup_dispatch_time_, kVoltaicSetupAttempt, now, eligible))
         {
             return no_action("Voltaic setup settling");
         }
@@ -1163,6 +1191,7 @@ private:
         RotationAction action = cast_damage(api, spellbook_.voltaic_blaze, state.target, reason);
         if (!action.is_none()) {
             voltaic_setup_pending_until_ = now + kVoltaicSetupPendingWindow;
+            last_voltaic_setup_dispatch_time_ = now;
         }
         return action;
     }
@@ -1667,7 +1696,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.2.6 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.2.8 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -2546,12 +2575,16 @@ private:
 
         // Step 1: Stormkeeper. Prepull success/buff normally completes this.
         if (!opener_stormkeeper_done_) {
-            if (still_pending(stormkeeper_pending_until_, api.get_game_time())) {
+            if (still_pending(stormkeeper_pending_until_, api.get_game_time()) ||
+                recently_attempted(last_stormkeeper_dispatch_time_, kStormkeeperAttempt,
+                    api.get_game_time()))
+            {
                 return no_action("Exact opener waiting for Stormkeeper");
             }
             if (RotationAction action = dispatch_player_setup(
                     api, spellbook_.stormkeeper, stormkeeper_pending_until_,
                     last_stormkeeper_success_time_, kStormkeeperSettle,
+                    last_stormkeeper_dispatch_time_, kStormkeeperAttempt,
                     "Exact opener 1: Stormkeeper"); !action.is_none())
             {
                 return action;
@@ -2565,12 +2598,16 @@ private:
 
         // Step 2: Farseer Ancestral Swiftness.
         if (!opener_swiftness_done_) {
-            if (still_pending(ancestral_swiftness_pending_until_, api.get_game_time())) {
+            if (still_pending(ancestral_swiftness_pending_until_, api.get_game_time()) ||
+                recently_attempted(last_ancestral_swiftness_dispatch_time_,
+                    kAncestralSwiftnessAttempt, api.get_game_time()))
+            {
                 return no_action("Exact opener waiting for Ancestral Swiftness");
             }
             if (RotationAction action = dispatch_player_setup(
                     api, spellbook_.ancestral_swiftness, ancestral_swiftness_pending_until_,
                     last_ancestral_swiftness_success_time_, kAncestralSwiftnessSettle,
+                    last_ancestral_swiftness_dispatch_time_, kAncestralSwiftnessAttempt,
                     "Exact opener 2: Ancestral Swiftness"); !action.is_none())
             {
                 return action;
@@ -2799,7 +2836,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.2.6 spell="
+        out << "DBG_CAST v2.2.8 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -2816,7 +2853,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.2.6 name="
+        out << "NO_TARGET v2.2.8 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -2834,7 +2871,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.2.6"
+        out << prefix << " v2.2.8"
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -2854,7 +2891,7 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.2.6 target="
+        out << "DBG v2.2.8 target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
@@ -2976,7 +3013,9 @@ private:
         const double now = api.get_game_time();
         const double pending_until = slot == 1 ? trinket_1_pending_until_ : trinket_2_pending_until_;
         const double last_success = slot == 1 ? last_trinket_1_success_time_ : last_trinket_2_success_time_;
+        const double last_attempt = slot == 1 ? last_trinket_1_attempt_time_ : last_trinket_2_attempt_time_;
         if (still_pending(pending_until, now) ||
+            recently_attempted(last_attempt, kTrinketAttempt, now) ||
             recently_succeeded(last_success, kTrinketSettle, now))
         {
             return false;
@@ -3009,8 +3048,10 @@ private:
         const double now = api.get_game_time();
         double& pending_until = slot == 1 ? trinket_1_pending_until_ : trinket_2_pending_until_;
         const double last_success = slot == 1 ? last_trinket_1_success_time_ : last_trinket_2_success_time_;
+        const double last_attempt = slot == 1 ? last_trinket_1_attempt_time_ : last_trinket_2_attempt_time_;
         if (setup_action_blocked(0x80000000u + static_cast<uint32_t>(slot),
-                pending_until, last_success, kTrinketSettle, now, true)) {
+                pending_until, last_success, kTrinketSettle,
+                last_attempt, kTrinketAttempt, now, true)) {
             return no_action("Trinket settling");
         }
 
@@ -3123,6 +3164,7 @@ private:
         const double now = api.get_game_time();
         if (!still_pending(stormkeeper_pending_until_, now) &&
             !recently_succeeded(last_stormkeeper_success_time_, kStormkeeperSettle, now) &&
+            !recently_attempted(last_stormkeeper_dispatch_time_, kStormkeeperAttempt, now) &&
             can_cast(api, spellbook_.stormkeeper))
         {
             const bool hold_for_ascendance = major_allowed && !force_burst && !fight_ending &&
@@ -3134,6 +3176,7 @@ private:
             }
             if (RotationAction action = dispatch_player_setup(api, spellbook_.stormkeeper,
                     stormkeeper_pending_until_, last_stormkeeper_success_time_, kStormkeeperSettle,
+                    last_stormkeeper_dispatch_time_, kStormkeeperAttempt,
                     force_burst ? "Stormkeeper - Burst Now" : "Stormkeeper synchronized use");
                 !action.is_none())
             {
@@ -3145,6 +3188,7 @@ private:
             if (RotationAction action = dispatch_player_setup(
                     api, spellbook_.ancestral_swiftness, ancestral_swiftness_pending_until_,
                     last_ancestral_swiftness_success_time_, kAncestralSwiftnessSettle,
+                    last_ancestral_swiftness_dispatch_time_, kAncestralSwiftnessAttempt,
                     "Ancestral Swiftness"); !action.is_none())
             {
                 return action;
@@ -3174,7 +3218,8 @@ private:
         const double now = api.get_game_time();
         const bool ascendance_eligible = can_cast(api, spellbook_.ascendance);
         if (setup_action_blocked(spellbook_.ascendance, ascendance_pending_until_,
-                last_ascendance_success_time_, kAscendanceSettle, now, ascendance_eligible))
+                last_ascendance_success_time_, kAscendanceSettle,
+                last_ascendance_dispatch_time_, kAscendanceAttempt, now, ascendance_eligible))
         {
             return no_action("Ascendance settling");
         }
@@ -3203,6 +3248,8 @@ private:
                 return action;
             }
             if (still_pending(voltaic_setup_pending_until_, api.get_game_time()) ||
+                recently_attempted(last_voltaic_setup_dispatch_time_, kVoltaicSetupAttempt,
+                    api.get_game_time()) ||
                 recently_succeeded(last_voltaic_blaze_success_time_, kVoltaicSetupSettle,
                     api.get_game_time()))
             {
@@ -3226,6 +3273,7 @@ private:
 
         return dispatch_player_setup(api, spellbook_.ascendance, ascendance_pending_until_,
             last_ascendance_success_time_, kAscendanceSettle,
+            last_ascendance_dispatch_time_, kAscendanceAttempt,
             force_burst ? "Ascendance - Burst Now" : "Ascendance synchronized burst");
 
     }
