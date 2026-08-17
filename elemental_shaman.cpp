@@ -1265,6 +1265,8 @@ private:
         int maelstrom_packets_ambiguous = 0;
         int maelstrom_packets_timeout = 0;
         int maelstrom_packets_overlap = 0;
+        int maelstrom_packets_capped = 0;
+        int maelstrom_packets_learnable = 0;
         // Direct comparison against the v2.3.4 first-delta observer.
         int packet_first_sum = 0;
         int packet_total_sum = 0;
@@ -1925,10 +1927,12 @@ private:
         return PacketContext::Normal;
     }
 
-    // Only quiet-closed, unambiguous builder packets describe real generation.
+    // Only quiet-closed, unambiguous, uncapped builder packets describe real
+    // generation. Structurally clean but capped packets are right-censored.
     void record_maelstrom_packet(const rotation_api::IRotationAPI& api,
                                  const MaelstromPacket& packet,
-                                 bool clean)
+                                 bool clean,
+                                 bool learnable)
     {
         if (!telemetry_combat_active_) return;
         if (!is_builder_spell(api, packet.spell_id)) return;
@@ -1939,6 +1943,7 @@ private:
             ++packet_ambiguous_by_enemies_[bucket][enemies];
             return;
         }
+        if (!learnable) return;
 
         ++telemetry_.builder_resolved;
         if (packet.positive_total > 0) {
@@ -2008,6 +2013,9 @@ private:
         if (overlapped) packet.ambiguous = true;
 
         const bool clean = !packet.ambiguous && !timed_out && !overlapped;
+        const int maelstrom_max = std::max(1, api.get_player_power_max("maelstrom"));
+        const bool capped = builder && packet.positive_total > 0 && current >= maelstrom_max;
+        const bool learnable = clean && !capped;
 
         if (telemetry_combat_active_) {
             ++telemetry_.maelstrom_packets_total;
@@ -2015,11 +2023,19 @@ private:
             if (packet.ambiguous) ++telemetry_.maelstrom_packets_ambiguous;
             if (timed_out) ++telemetry_.maelstrom_packets_timeout;
             if (overlapped) ++telemetry_.maelstrom_packets_overlap;
+            if (capped) ++telemetry_.maelstrom_packets_capped;
+            if (learnable) ++telemetry_.maelstrom_packets_learnable;
         }
-        record_maelstrom_packet(api, packet, clean);
+        record_maelstrom_packet(api, packet, clean, learnable);
 
         if (!debug_diagnostics_) return;
         if (packet.changes == 0) return;
+
+        const char* quality = "full_clean";
+        if (overlapped) quality = "overlap";
+        else if (timed_out) quality = "timeout";
+        else if (packet.ambiguous) quality = "ambiguous";
+        else if (capped) quality = "capped";
 
         std::ostringstream out;
         out << "MAELSTROM_PACKET spell=" << packet.spell_id << '/'
@@ -2037,6 +2053,8 @@ private:
             << " duration=" << format_seconds(now - packet.opened_at)
             << " changes=" << packet.changes
             << " ambiguous=" << (packet.ambiguous ? 1 : 0)
+            << " capped=" << (capped ? 1 : 0)
+            << " quality=" << quality
             << " close=" << close_reason;
         context.log(out.str());
     }
@@ -3211,6 +3229,8 @@ private:
                     << " maelstrom_packets_ambiguous=" << telemetry_.maelstrom_packets_ambiguous
                     << " maelstrom_packets_timeout=" << telemetry_.maelstrom_packets_timeout
                     << " maelstrom_packets_overlap=" << telemetry_.maelstrom_packets_overlap
+                    << " maelstrom_packets_capped=" << telemetry_.maelstrom_packets_capped
+                    << " maelstrom_packets_learnable=" << telemetry_.maelstrom_packets_learnable
                     << " packet_first_sum=" << telemetry_.packet_first_sum
                     << " packet_total_sum=" << telemetry_.packet_total_sum;
                 context.log(report.str());
