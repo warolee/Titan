@@ -138,9 +138,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.3.6: Maelstrom packet first-delta ownership";
+        return "Midnight Season 2 Elemental Shaman v2.3.7: stall out-of-range telemetry";
     }
-    RotationVersion get_version() const override { return {2, 3, 6}; }
+    RotationVersion get_version() const override { return {2, 3, 7}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -475,6 +475,7 @@ public:
         stall_begin_moving_ = false;
         stall_begin_pending_spell_ = 0;
         stall_begin_suppressed_spell_ = 0;
+        stall_begin_out_of_range_ = false;
         last_maintenance_spell_id_ = 0;
         last_maintenance_dispatch_time_ = -999.0;
         last_ghost_wolf_dispatch_time_ = -999.0;
@@ -510,7 +511,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.3.6 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.3.7 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -1086,6 +1087,7 @@ private:
     bool stall_begin_moving_ = false;
     uint32_t stall_begin_pending_spell_ = 0;
     uint32_t stall_begin_suppressed_spell_ = 0;
+    bool stall_begin_out_of_range_ = false;
 
     std::vector<std::string> damage_debug_messages_;
     uint32_t last_damage_dispatch_log_spell_ = 0;
@@ -1246,6 +1248,7 @@ private:
         int stall_cast_tail = 0;
         int stall_pending = 0;
         int stall_suppression = 0;
+        int stall_out_of_range = 0;
         int stall_apl_no_action = 0;
         int builder_resolved = 0;
         int builder_positive_delta = 0;
@@ -1599,10 +1602,14 @@ private:
         stall_begin_moving_ = moving;
         stall_begin_cast_tail_ = damage_dispatch_.pending &&
             damage_dispatch_.cast_started_at > 0.0 && info.is_active();
+        stall_begin_out_of_range_ =
+            can_damage_action_target(api, state.target) &&
+            !representative_damage_in_range(api, state.target) &&
+            !state.healthy_hostile_alternative;
         if (!debug_diagnostics_) return;
 
         std::ostringstream out;
-        out << "STALL_BEGIN v2.3.6"
+        out << "STALL_BEGIN v2.3.7"
             << " time=" << format_seconds(stall_started_at_)
             << " pending=" << (stall_begin_pending_ ? 1 : 0)
             << " pending_spell=" << stall_begin_pending_spell_
@@ -1610,6 +1617,7 @@ private:
             << " cast=" << info.spell_id
             << " cast_strict=" << (player_cast_active_strict(api) ? 1 : 0)
             << " suppressed_spell=" << stall_begin_suppressed_spell_
+            << " oor=" << (stall_begin_out_of_range_ ? 1 : 0)
             << " last_success=" << (last_successful_damage_spell_.empty()
                 ? std::string("<none>") : last_successful_damage_spell_)
             << " maelstrom=" << state.maelstrom
@@ -1624,6 +1632,7 @@ private:
         if (stall_begin_cast_tail_) return "post_cast_tail";
         if (stall_begin_pending_) return "pending_resolution";
         if (stall_begin_suppressed_spell_ != 0) return "suppression";
+        if (stall_begin_out_of_range_) return "out_of_range";
         return "apl_no_action";
     }
 
@@ -1648,6 +1657,7 @@ private:
             if (stall_begin_cast_tail_) ++telemetry_.stall_cast_tail;
             else if (stall_begin_pending_) ++telemetry_.stall_pending;
             else if (stall_begin_suppressed_spell_ != 0) ++telemetry_.stall_suppression;
+            else if (stall_begin_out_of_range_) ++telemetry_.stall_out_of_range;
             else ++telemetry_.stall_apl_no_action;
         }
 
@@ -1661,6 +1671,7 @@ private:
         stall_begin_moving_ = false;
         stall_begin_pending_spell_ = 0;
         stall_begin_suppressed_spell_ = 0;
+        stall_begin_out_of_range_ = false;
     }
 
     // -------------------------------------------------------------------------
@@ -3169,7 +3180,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.3.6 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.3.7 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -3211,6 +3222,7 @@ private:
                     << " stall_cast_tail=" << telemetry_.stall_cast_tail
                     << " stall_pending=" << telemetry_.stall_pending
                     << " stall_suppression=" << telemetry_.stall_suppression
+                    << " stall_out_of_range=" << telemetry_.stall_out_of_range
                     << " stall_apl_no_action=" << telemetry_.stall_apl_no_action
                     << " builder_resolved=" << telemetry_.builder_resolved
                     << " builder_positive_delta=" << telemetry_.builder_positive_delta
@@ -4618,7 +4630,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.3.6 spell="
+        out << "DBG_CAST v2.3.7 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -4635,7 +4647,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.3.6 name="
+        out << "NO_TARGET v2.3.7 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -4653,7 +4665,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.3.6"
+        out << prefix << " v2.3.7"
             << " pend=" << debug_bool(damage_dispatch_.pending)
             << '/' << damage_dispatch_.spell_id
             << " supp=" << damage_dispatch_.suppressed_spell_id
@@ -4679,7 +4691,7 @@ private:
         std::ostringstream out;
         // Queue window sizes come straight from Titan so the next log can show
         // what it actually grants instead of an assumed value.
-        out << "DBG v2.3.6"
+        out << "DBG v2.3.7"
             << " q=" << std::fixed << std::setprecision(2)
             << api.get_rotation_spell_queue_window()
             << '/' << api.get_in_game_spell_queue_window()
