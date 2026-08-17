@@ -476,6 +476,7 @@ public:
         stall_begin_pending_spell_ = 0;
         stall_begin_suppressed_spell_ = 0;
         stall_begin_out_of_range_ = false;
+        lightning_rod_probe_ = {};
         last_maintenance_spell_id_ = 0;
         last_maintenance_dispatch_time_ = -999.0;
         last_ghost_wolf_dispatch_time_ = -999.0;
@@ -508,6 +509,7 @@ public:
         update_combat_telemetry(context);
         update_cast_history(api);
         observe_maelstrom(context);
+        maybe_log_lightning_rod_probe(context);
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
@@ -602,6 +604,7 @@ public:
         const auto& api = ctx.api();
         refresh_spellbook(api);
         update_cast_history(api);
+        maybe_log_lightning_rod_probe(ctx);
         reconcile_damage_dispatch(api);
         for (const std::string& message : damage_debug_messages_) ctx.log(message);
         damage_debug_messages_.clear();
@@ -1088,6 +1091,20 @@ private:
     uint32_t stall_begin_pending_spell_ = 0;
     uint32_t stall_begin_suppressed_spell_ = 0;
     bool stall_begin_out_of_range_ = false;
+
+    // Debug-only: delayed aura dumps after a confirmed Earthquake success.
+    // Never read by action selection.
+    struct LightningRodProbe {
+        bool active = false;
+        double eq_confirmed_at = -999.0;
+        int next_snapshot = 0;
+    } lightning_rod_probe_;
+    static constexpr int kLightningRodProbeSnapshots = 3;
+    static constexpr int kLightningRodProbeMaxUnits = 8;
+    static constexpr int kLightningRodProbeMaxAuras = 16;
+    static constexpr double kLightningRodProbeAges[kLightningRodProbeSnapshots] = {
+        0.25, 0.75, 1.50
+    };
 
     std::vector<std::string> damage_debug_messages_;
     uint32_t last_damage_dispatch_log_spell_ = 0;
@@ -2998,6 +3015,11 @@ private:
                 // Canonicalize even if a localized/override spell name is late.
                 name = "Lava Burst";
             }
+            // Same confirmed-success source as telemetry_.earthquakes.
+            // Name matching is not used: SPELL [OK] / dispatch never arms this.
+            if (debug_diagnostics_ && event.spell_id == spellbook_.earthquake) {
+                arm_lightning_rod_probe(event.time > 0.0 ? event.time : api.get_game_time());
+            }
             if (same_name(name, "Stormkeeper") || event.spell_id == spellbook_.stormkeeper) {
                 last_stormkeeper_success_time_ = event.time;
                 stormkeeper_pending_until_ = -999.0;
@@ -3306,6 +3328,102 @@ private:
             count = 1;
         }
         return count;
+    }
+
+    void arm_lightning_rod_probe(double confirmed_at) {
+        lightning_rod_probe_.active = true;
+        lightning_rod_probe_.eq_confirmed_at = confirmed_at;
+        lightning_rod_probe_.next_snapshot = 0;
+    }
+
+    void maybe_log_lightning_rod_probe(const RotationContext& context) {
+        if (!debug_diagnostics_) {
+            lightning_rod_probe_ = {};
+            return;
+        }
+        if (!lightning_rod_probe_.active) return;
+        if (lightning_rod_probe_.next_snapshot < 0 ||
+            lightning_rod_probe_.next_snapshot >= kLightningRodProbeSnapshots)
+        {
+            lightning_rod_probe_ = {};
+            return;
+        }
+
+        const auto& api = context.api();
+        const double now = api.get_game_time();
+        const double age = now - lightning_rod_probe_.eq_confirmed_at;
+        const double due = kLightningRodProbeAges[lightning_rod_probe_.next_snapshot];
+        if (age < due) return;
+
+        const int snapshot = lightning_rod_probe_.next_snapshot;
+        ++lightning_rod_probe_.next_snapshot;
+        if (lightning_rod_probe_.next_snapshot >= kLightningRodProbeSnapshots) {
+            lightning_rod_probe_.active = false;
+        }
+
+        std::string units[kLightningRodProbeMaxUnits];
+        int unit_count = 0;
+        int enemies = 0;
+        const auto add_unit = [&](const std::string& unit) {
+            if (unit.empty() || unit_count >= kLightningRodProbeMaxUnits) return;
+            for (int i = 0; i < unit_count; ++i) {
+                if (units[i] == unit) return;
+            }
+            units[unit_count++] = unit;
+        };
+        if (current_target_is_hostile(api)) add_unit("target");
+        for (const auto& enemy : api.get_nameplates_in_range(40.0, true, false)) {
+            if (enemy.unit_token.empty() || !can_damage_unit(api, enemy.unit_token)) continue;
+            ++enemies;
+            add_unit(enemy.unit_token);
+        }
+        if (enemies == 0 && current_target_is_hostile(api)) enemies = 1;
+
+        std::ostringstream header;
+        header << "LR_PROBE snapshot=" << snapshot
+            << " age=" << format_seconds(age)
+            << " due=" << format_seconds(due)
+            << " enemies=" << enemies
+            << " observed_rods=" << count_debuff(api, "Lightning Rod")
+            << " units=" << unit_count
+            << " eq_id=" << spellbook_.earthquake;
+        context.log(header.str());
+
+        for (int i = 0; i < unit_count; ++i) {
+            const std::string& unit = units[i];
+            const auto auras = api.get_debuffs(unit, false);
+            const std::string unit_name = api.get_unit_name(unit);
+            const std::string unit_label = unit + '/' +
+                (unit_name.empty() ? std::string("<unnamed>") : unit_name);
+            int logged = 0;
+            for (const auto& aura : auras) {
+                if (logged >= kLightningRodProbeMaxAuras) break;
+                const bool exact_match = same_name(aura.name, "Lightning Rod") &&
+                    aura.is_from_player_or_pet();
+                std::ostringstream line;
+                line << "LR_AURA unit=" << unit_label
+                    << " name=\"" << (aura.name.empty() ? std::string("<empty>") : aura.name) << '"'
+                    << " id=" << aura.aura_id
+                    << " inst=" << aura.instance_id
+                    << " src=" << (aura.source.empty() ? std::string("<none>") : aura.source)
+                    << " player_src=" << (aura.is_player_source() ? 1 : 0)
+                    << " player_pet=" << (aura.is_from_player_or_pet() ? 1 : 0)
+                    << " stacks=" << aura.stacks
+                    << " remain=" << format_seconds(aura.remaining)
+                    << " duration=" << format_seconds(aura.duration)
+                    << " priv=" << (aura.is_private ? 1 : 0)
+                    << " exact_lr=" << (exact_match ? 1 : 0);
+                context.log(line.str());
+                ++logged;
+            }
+            if (logged == 0) {
+                context.log("LR_AURA unit=" + unit_label + " none=1 auras=" +
+                    std::to_string(static_cast<int>(auras.size())));
+            } else if (static_cast<int>(auras.size()) > logged) {
+                context.log("LR_AURA unit=" + unit_label + " truncated=" +
+                    std::to_string(static_cast<int>(auras.size()) - logged));
+            }
+        }
     }
 
     // Titan 23.3 documents hostile SpellAction units as current-target casts;
@@ -3767,19 +3885,25 @@ private:
             }
             return no_action("Earthquake held while pack is gathering");
         }
-        // The APL only reaches this point when Earthquake is a legitimate
-        // current candidate, which makes it the one unambiguous place to count
-        // discrete opportunities against confirmed casts.
-        if (telemetry_combat_active_ && state.use_aoe_list && state.enemies >= 3) {
-            ++telemetry_.earthquake_opportunities;
-        }
+
+        // Counts Earthquake actions actually returned to Titan, so EQ_opp can
+        // be compared against confirmed Earthquake casts. It is not a cast
+        // confirmation and is not incremented when later dispatch checks fail.
+        const bool count_opportunity = telemetry_combat_active_ &&
+            state.use_aoe_list && state.enemies >= 3;
+
         if (state.talent_earthquake) {
-            return cast_damage(api, spellbook_.earthquake, state.target,
+            RotationAction action = cast_damage(api, spellbook_.earthquake, state.target,
                 reason + " Earthquake on target");
+            if (!action.is_none() && count_opportunity) ++telemetry_.earthquake_opportunities;
+            return action;
         }
+
         note_input_dispatch(api);
-        return macro(elemental_ids::EARTHQUAKE_CURSOR_MACRO,
+        RotationAction action = macro(elemental_ids::EARTHQUAKE_CURSOR_MACRO,
             reason + " Earthquake @cursor compatibility fallback");
+        if (!action.is_none() && count_opportunity) ++telemetry_.earthquake_opportunities;
+        return action;
     }
 
     // -------------------------------------------------------------------------
