@@ -138,9 +138,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.3.5: trinket sync and Maelstrom packet telemetry";
+        return "Midnight Season 2 Elemental Shaman v2.3.6: Maelstrom packet first-delta ownership";
     }
-    RotationVersion get_version() const override { return {2, 3, 5}; }
+    RotationVersion get_version() const override { return {2, 3, 6}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -510,7 +510,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.3.5 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.3.6 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -1600,7 +1600,7 @@ private:
         if (!debug_diagnostics_) return;
 
         std::ostringstream out;
-        out << "STALL_BEGIN v2.3.5"
+        out << "STALL_BEGIN v2.3.6"
             << " time=" << format_seconds(stall_started_at_)
             << " pending=" << (stall_begin_pending_ ? 1 : 0)
             << " pending_spell=" << stall_begin_pending_spell_
@@ -2060,24 +2060,22 @@ private:
         maelstrom_request_ = {};
     }
 
-    // Single per-tick resource read, unchanged from v2.3.4. A newly resolved
-    // action owns the movement since the previous sample, not from current.
+    // Stage 1: a newly resolved action owns current-vs-previous. The old packet
+    // is closed first so that delta cannot land on both owners.
     void observe_maelstrom(const RotationContext& context) {
         const auto& api = context.api();
         const int previous = last_observed_maelstrom_;
         const int current = api.get_player_power("maelstrom");
         const double now = api.get_game_time();
         const bool have_previous = previous >= 0;
+        const int baseline = have_previous ? previous : current;
 
         if (maelstrom_request_.pending) {
-            // The previous packet never settled, so neither it nor its successor
-            // can claim delayed resource with confidence.
             const bool overlapped = maelstrom_packet_.active;
             if (overlapped) {
-                close_maelstrom_packet(context, have_previous ? previous : current,
-                    now, "overlap", false, true);
+                close_maelstrom_packet(context, baseline, now, "overlap", false, true);
             }
-            open_maelstrom_packet(have_previous ? previous : current, now, overlapped);
+            open_maelstrom_packet(baseline, now, overlapped);
             apply_maelstrom_delta(current, now);
         } else {
             apply_maelstrom_delta(current, now);
@@ -3152,7 +3150,7 @@ private:
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.3.5 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.3.6 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -4599,7 +4597,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.3.5 spell="
+        out << "DBG_CAST v2.3.6 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -4616,7 +4614,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.3.5 name="
+        out << "NO_TARGET v2.3.6 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -4634,7 +4632,7 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.3.5"
+        out << prefix << " v2.3.6"
             << " pend=" << debug_bool(damage_dispatch_.pending)
             << '/' << damage_dispatch_.spell_id
             << " supp=" << damage_dispatch_.suppressed_spell_id
@@ -4660,7 +4658,7 @@ private:
         std::ostringstream out;
         // Queue window sizes come straight from Titan so the next log can show
         // what it actually grants instead of an assumed value.
-        out << "DBG v2.3.5"
+        out << "DBG v2.3.6"
             << " q=" << std::fixed << std::setprecision(2)
             << api.get_rotation_spell_queue_window()
             << '/' << api.get_in_game_spell_queue_window()
