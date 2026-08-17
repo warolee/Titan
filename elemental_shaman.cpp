@@ -5462,11 +5462,12 @@ private:
             }
         }
 
-        // ST 9: consume Stormkeeper with Lightning Bolt. The Lava Burst block
-        // above tries to prepare MotE first, but Stormkeeper is not held if that
-        // setup is unavailable.
+        // ST 9: Stormkeeper Lightning Bolt only when MotE is up and Tempest is
+        // talented, matching live SimC. Forecast is diagnostic-only and is not
+        // a gate. If this line does not fire, later fillers still consume LB.
         if (state.buff_stormkeeper &&
-            state.maelstrom_deficit > state.forecast_builder_gain &&
+            state.buff_master_of_the_elements &&
+            state.talent_tempest &&
             can_cast(api, spellbook_.lightning_bolt))
         {
             if (RotationAction action = cast_damage(api, spellbook_.lightning_bolt, state.target,
@@ -5478,15 +5479,9 @@ private:
 
         // ST 10: Elemental Blast/Earth Shock with MotE or near Maelstrom cap.
         if (!state.bank_maelstrom &&
-            (state.buff_master_of_the_elements || state.maelstrom_deficit < spender_deficit_ ||
-             state.forecast_overcap))
+            (state.buff_master_of_the_elements || state.maelstrom_deficit < spender_deficit_))
         {
             if (RotationAction action = cast_spender(api, state, false, "Single-target spender"); !action.is_none()) {
-                if (state.forecast_overcap && telemetry_combat_active_ &&
-                    (api.get_game_time() - last_forecast_save_time_) >= 0.75) {
-                    last_forecast_save_time_ = api.get_game_time();
-                    ++telemetry_.forecast_saves;
-                }
                 return action;
             }
         }
