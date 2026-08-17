@@ -138,9 +138,9 @@ public:
     std::string get_name() const override { return "Llama's Elemental"; }
     std::string get_author() const override { return "Llama"; }
     std::string get_description() const override {
-        return "Midnight Season 2 Elemental Shaman v2.3.3: Lava Burst dispatch reliability";
+        return "Midnight Season 2 Elemental Shaman v2.3.5: trinket sync and Maelstrom packet telemetry";
     }
-    RotationVersion get_version() const override { return {2, 3, 3}; }
+    RotationVersion get_version() const override { return {2, 3, 5}; }
     std::string get_class_name() const override { return "Shaman"; }
     std::string get_spec_name() const override { return "Elemental"; }
 
@@ -239,6 +239,10 @@ public:
         schema.add(SettingDefinition::make_bool("auto_stun", "Capacitor Backup Stun", false)
             .set_description("Use Capacitor Totem as a configured Mythic+ backup stop.")
             .set_group("advanced"));
+        schema.add(SettingDefinition::make_bool("queue_window_casting", "Queue Window Casting", true)
+            .set_description("Send the next Lightning Bolt/Chain Lightning during Titan's spell "
+                             "queue window at the end of your own hardcast.")
+            .set_group("advanced"));
         schema.add(SettingDefinition::make_bool("debug_diagnostics", "Debug Diagnostics", false)
             .set_description("Enable detailed rotation diagnostics for troubleshooting.")
             .set_group("advanced"));
@@ -257,6 +261,7 @@ public:
         hero_mode_ = static_cast<int>(s.get_enum("hero_mode", 0));
         automatic_target_recovery_ = s.get_bool("automatic_target_recovery", true);
         auto_ghost_wolf_ = s.get_bool("auto_ghost_wolf", true);
+        queue_window_casting_ = s.get_bool("queue_window_casting", true);
         debug_diagnostics_ = s.get_bool("debug_diagnostics", false);
         cooldown_policy_ = static_cast<int>(s.get_enum("cooldown_policy", 0));
         trinket_1_mode_ = std::clamp(static_cast<int>(s.get_enum("trinket_1_mode", 2)), 0, 4);
@@ -334,6 +339,7 @@ public:
         settings["hero_mode"] = static_cast<int64_t>(hero_mode_);
         settings["automatic_target_recovery"] = automatic_target_recovery_;
         settings["auto_ghost_wolf"] = auto_ghost_wolf_;
+        settings["queue_window_casting"] = queue_window_casting_;
         settings["debug_diagnostics"] = debug_diagnostics_;
         settings["cooldown_policy"] = static_cast<int64_t>(cooldown_policy_);
         settings["trinket_1_mode"] = static_cast<int64_t>(trinket_1_mode_);
@@ -419,6 +425,11 @@ public:
         trinket_1_item_id_ = 0;
         trinket_2_item_id_ = 0;
         trinket_break_message_.clear();
+        clear_major_trinket_sync();
+        major_trinket_bypass_until_[0] = -999.0;
+        major_trinket_bypass_until_[1] = -999.0;
+        major_trinket_bypass_item_[0] = 0;
+        major_trinket_bypass_item_[1] = 0;
         last_retarget_attempt_time_ = -999.0;
         target_unreachable_since_ = -999.0;
         recovery_watch_guid_.clear();
@@ -448,9 +459,22 @@ public:
         dispatch_probe_ = {};
         execution_suspect_spell_ = 0;
         execution_suspect_escapes_ = 0;
-        execution_blocked_ = false;
-        execution_block_until_ = -999.0;
         execution_break_message_.clear();
+        queued_for_cast_at_ = -999.0;
+        expected_prior_success_spell_ = 0;
+        expected_prior_success_until_ = -999.0;
+        escape_watch_spell_ = 0;
+        escape_watch_until_ = -999.0;
+        escape_watch_dispatched_at_ = -999.0;
+        queued_prior_cast_start_ = -999.0;
+        stall_active_ = false;
+        stall_started_at_ = -999.0;
+        stall_last_tick_at_ = -999.0;
+        stall_begin_pending_ = false;
+        stall_begin_cast_tail_ = false;
+        stall_begin_moving_ = false;
+        stall_begin_pending_spell_ = 0;
+        stall_begin_suppressed_spell_ = 0;
         last_maintenance_spell_id_ = 0;
         last_maintenance_dispatch_time_ = -999.0;
         last_ghost_wolf_dispatch_time_ = -999.0;
@@ -486,7 +510,7 @@ public:
 
         const HeroTree detected = detect_hero_tree(api);
         if (!hero_tree_was_logged_ || detected != last_logged_hero_tree_) {
-            context.log("Llama's Elemental v2.3.3 hero mode: " + hero_tree_name(detected));
+            context.log("Llama's Elemental v2.3.5 hero mode: " + hero_tree_name(detected));
             last_logged_hero_tree_ = detected;
             hero_tree_was_logged_ = true;
         }
@@ -593,15 +617,49 @@ public:
             return no_action(debug_diagnostics_ ? debug_cast_snapshot(api) : "Casting");
         }
 
+        // SURVIVAL / INTERRUPT PRE-LAYER: an ordinary damage button that has not
+        // resolved yet must never hold a kick or an emergency defensive behind
+        // its confirmation window. This only runs on ticks that are about to
+        // wait, so a normal tick keeps the original order and cost.
+        const double settle_remaining =
+            kInputSettleWindow - (api.get_game_time() - last_input_dispatch_time_);
+        if (settle_remaining > 0.0 || damage_dispatch_.pending) {
+            // Wind Shear is dispatched untracked, so it cannot collide with the
+            // unresolved damage button.
+            if (utility_profile_ != 2) {
+                if (RotationAction action = interrupt_action(api); !action.is_none()) {
+                    return action;
+                }
+            }
+            if (emergency_defensive_possible(api)) {
+                CombatState emergency = build_state(api);
+                last_global_lock_ = {emergency.global_lock, emergency.gcd_desync,
+                                     emergency.global_lock_remaining};
+                if (RotationAction action = defensive_action(api, emergency); !action.is_none()) {
+                    return action;
+                }
+            }
+        }
+
         // Titan can keep a stale cast/GCD snapshot for ~100-170ms after a
         // button is sent. Wait out the remainder of the 0.20s window so the
         // next tick can see the resulting state. This is not a GCD and does
         // not throttle the rotation after the snapshot catches up.
-        {
-            const double remaining =
-                kInputSettleWindow - (api.get_game_time() - last_input_dispatch_time_);
-            if (remaining > 0.0) {
-                return wait_action(remaining * 1000.0, "Input settle");
+        if (settle_remaining > 0.0) {
+            return wait_action(settle_remaining * 1000.0, "Input settle");
+        }
+
+        // Our own hardcast is still running even though Titan reports the
+        // player free for the queue window. Once the single queued filler for
+        // this cast has been used, or queue casting is off, wait out the cast
+        // instead of evaluating a list that cannot dispatch anything.
+        if (damage_dispatch_.pending && damage_dispatch_.cast_started_at > 0.0) {
+            const double cast_remaining = player_cast_remaining(api);
+            const bool queue_used = !queue_window_casting_ ||
+                queued_for_cast_at_ == damage_dispatch_.cast_started_at;
+            if (cast_remaining > 0.0 && queue_used) {
+                return wait_action(std::clamp(cast_remaining * 1000.0, 30.0, 750.0),
+                    "CAST_TAIL");
             }
         }
 
@@ -610,7 +668,8 @@ public:
         // bridge only the remainder of its confirmation window. Nothing here
         // re-sends, re-times, or replaces the pending action.
         if (damage_dispatch_.pending) {
-            const double remaining = kDamageDispatchConfirmWindow -
+            const double remaining = kDamageDispatchConfirmWindow +
+                damage_dispatch_.queue_grace -
                 (api.get_game_time() - damage_dispatch_.dispatched_at);
             if (remaining > 0.0) {
                 return wait_action(remaining * 1000.0, "Damage dispatch pending");
@@ -645,12 +704,15 @@ public:
             }
         }
 
-        // GLOBAL PRIORITY 1: stay alive.
+        // GLOBAL PRIORITY 1: stay alive. The emergency branch above only covers
+        // low health; the full profile still runs here with the real snapshot.
         if (RotationAction action = defensive_action(api, state); !action.is_none()) {
             return action;
         }
 
         // GLOBAL PRIORITY 2: stop an interruptible enemy cast with Wind Shear.
+        // Ticks that were about to wait on the dispatcher already checked this
+        // above, so a kick is never delayed by an unresolved damage button.
         if (utility_profile_ != 2) {
             if (RotationAction action = interrupt_action(api); !action.is_none()) {
                 return action;
@@ -705,9 +767,11 @@ public:
             if (RotationAction action = movement_action(api, state); !action.is_none()) {
                 return action;
             }
-            return no_action(debug_diagnostics_
+            const std::string reason = debug_diagnostics_
                 ? debug_stall_reason(api, state, "MOVING_STALL")
-                : "Moving - no instant action");
+                : std::string("Moving - no instant action");
+            note_stall_tick(api, state, true, reason);
+            return no_action(reason);
         }
 
         // GLOBAL PRIORITY 6: complete the cast-confirmed burst opener before
@@ -733,9 +797,11 @@ public:
             return action;
         }
 
-        return no_action(debug_diagnostics_
+        const std::string reason = debug_diagnostics_
             ? debug_stall_reason(api, state, "STALL")
-            : "No Elemental action");
+            : std::string("No Elemental action");
+        note_stall_tick(api, state, false, reason);
+        return no_action(reason);
     }
 
 private:
@@ -933,6 +999,7 @@ private:
     double mplus_meaningful_enemy_ttd_ = 6.0;
     double mplus_meaningful_enemy_hp_ = 10.0;
     bool debug_diagnostics_ = false;
+    bool queue_window_casting_ = true;
     double debug_interval_ = 2.0;
     double last_debug_log_time_ = -999.0;
     double last_cd_toggle_diag_time_ = -999.0;
@@ -981,7 +1048,44 @@ private:
         uint32_t suppressed_spell_id = 0;
         std::string suppressed_target_guid;
         double suppressed_until = -999.0;
+
+        // Extra confirmation time granted because the button was sent inside
+        // the spell queue window of a cast that was still finishing. The game
+        // cannot start a queued spell before that cast ends.
+        double queue_grace = 0.0;
+        bool queued_send = false;
     } damage_dispatch_;
+
+    // -------------------------------------------------------------------------
+    // SPELL QUEUE WINDOW STATE
+    // -------------------------------------------------------------------------
+    // Titan reports the player as free during the tail of a hardcast when
+    // include_rotation_spell_queue_window is true, which is how it invites the
+    // next button. Exactly one filler may be queued per cast instance.
+    double queued_for_cast_at_ = -999.0;
+    uint32_t expected_prior_success_spell_ = 0;
+    double expected_prior_success_until_ = -999.0;
+    // Start time of the cast a button was queued behind. Chain Lightning after
+    // Chain Lightning shares an ID, so only this distinguishes the finishing
+    // cast bar from the queued one.
+    double queued_prior_cast_start_ = -999.0;
+
+    // Rare escape follow-up: proves whether an escaped button executed late.
+    uint32_t escape_watch_spell_ = 0;
+    double escape_watch_until_ = -999.0;
+    double escape_watch_dispatched_at_ = -999.0;
+
+    // -------------------------------------------------------------------------
+    // STALL EPISODE STATE (fixed scalars only)
+    // -------------------------------------------------------------------------
+    bool stall_active_ = false;
+    double stall_started_at_ = -999.0;
+    double stall_last_tick_at_ = -999.0;
+    bool stall_begin_pending_ = false;
+    bool stall_begin_cast_tail_ = false;
+    bool stall_begin_moving_ = false;
+    uint32_t stall_begin_pending_spell_ = 0;
+    uint32_t stall_begin_suppressed_spell_ = 0;
 
     std::vector<std::string> damage_debug_messages_;
     uint32_t last_damage_dispatch_log_spell_ = 0;
@@ -990,25 +1094,26 @@ private:
     double last_unmatched_success_log_time_ = -999.0;
 
     // -------------------------------------------------------------------------
-    // DISPATCH EXECUTION PROBE / CIRCUIT BREAKER
+    // DISPATCH EXECUTION PROBE
     // -------------------------------------------------------------------------
     // Runtime proved a rotational spell can be accepted by the executor and
-    // still never reach the game. The probe records what was true at dispatch
-    // so the resolution line can name the failure, and the breaker stops a
-    // provably non-executing spell from owning the dispatcher every ~1.2s.
+    // still never reach the game (the v2.3.3 BUTTON5 Lava Burst case). The
+    // probe records what was true at dispatch so a resolution line can name the
+    // failure. v2.3.4 removed the production blocker: measured escapes are
+    // frequently false, so no ordinary damage spell is ever parked.
     struct DispatchProbe {
         double gcd_at_dispatch = 0.0;
         bool locked_at_dispatch = false;
         bool instant_expected = false;
+        bool queue_window_at_dispatch = false;
         uint32_t success_index_at_dispatch = 0;
+        uint32_t cast_at_dispatch = 0;
     } dispatch_probe_;
 
     enum class DispatchResult { SuccessHistory, CastStarted, TargetChanged, Escaped };
 
     uint32_t execution_suspect_spell_ = 0;
     int execution_suspect_escapes_ = 0;
-    bool execution_blocked_ = false;
-    double execution_block_until_ = -999.0;
     std::string execution_break_message_;
 
     // Long-duration buff upkeep owns a single attempt latch. It never takes
@@ -1022,19 +1127,81 @@ private:
     // -------------------------------------------------------------------------
     // Measures the real resource against resolved rotational actions. Nothing
     // here may influence action selection.
-    struct MaelstromAttribution {
+    // One resolved rotational action owns one resource packet. v2.3.4 closed the
+    // sample on the first movement, which measured 1420 of the 3152 points of
+    // positive Maelstrom seen in the reference log; the rest arrived after the
+    // sample had already closed. The packet keeps accumulating until the
+    // resource goes quiet or the hard lifetime expires.
+    struct MaelstromPacket {
         bool active = false;
         bool ambiguous = false;
         uint32_t spell_id = 0;
-        std::string spell_name;
-        int before = 0;
-        double started_at = -999.0;
+        int start = 0;
+        int last = 0;
+        int positive_total = 0;
+        int negative_total = 0;
+        int first_positive = 0;
+        int changes = 0;
+        double opened_at = -999.0;
+        double last_change_at = -999.0;
         int enemies = 0;
         bool stormkeeper = false;
         bool ancestral_swiftness = false;
         bool ascendance = false;
         bool lust = false;
-    } maelstrom_attribution_;
+    } maelstrom_packet_;
+
+    // A resolution can be detected inside get_combat_action(), after the tick's
+    // resource sample already ran. The request is serviced by the next sample so
+    // every packet opens against a freshly observed baseline without adding a
+    // second power read.
+    struct MaelstromPacketRequest {
+        bool pending = false;
+        bool ambiguous = false;
+        uint32_t spell_id = 0;
+        int enemies = 0;
+        bool stormkeeper = false;
+        bool ancestral_swiftness = false;
+        bool ascendance = false;
+        bool lust = false;
+    } maelstrom_request_;
+
+    enum class BuilderBucket { LightningBolt, ChainLightning, LavaBurst, VoltaicBlaze,
+                               Tempest, Other, Count };
+    enum class PacketContext { Normal, Stormkeeper, AncestralSwiftness, Ascendance,
+                               Lust, Count };
+    static constexpr int kBuilderBuckets = static_cast<int>(BuilderBucket::Count);
+    static constexpr int kEnemyBuckets = 5;
+    static constexpr int kPacketContexts = static_cast<int>(PacketContext::Count);
+
+    struct PacketStat {
+        int count = 0;
+        long long sum = 0;
+        int min = 0;
+        int max = 0;
+        double ewma = 0.0;
+
+        void add(int value) {
+            if (count == 0) {
+                min = value;
+                max = value;
+                ewma = static_cast<double>(value);
+            } else {
+                if (value < min) min = value;
+                if (value > max) max = value;
+                ewma = 0.25 * static_cast<double>(value) + 0.75 * ewma;
+            }
+            ++count;
+            sum += value;
+        }
+        double average() const {
+            return count > 0 ? static_cast<double>(sum) / count : 0.0;
+        }
+    };
+
+    PacketStat packet_by_enemies_[kBuilderBuckets][kEnemyBuckets];
+    PacketStat packet_by_context_[kBuilderBuckets][kPacketContexts];
+    int packet_ambiguous_by_enemies_[kBuilderBuckets][kEnemyBuckets] = {};
 
     int last_observed_maelstrom_ = -1;
     double last_maelstrom_sample_time_ = -999.0;
@@ -1061,12 +1228,25 @@ private:
         int lava_burst_confirmed = 0;
         int lava_burst_cast_started = 0;
         int lava_burst_escaped = 0;
-        int lava_burst_blocked = 0;
         int damage_dispatches = 0;
         int damage_started = 0;
         int damage_confirmed = 0;
         int damage_escapes = 0;
         int damage_suppressed = 0;
+        int escape_late_success = 0;
+        int queue_releases = 0;
+        int queue_confirmed = 0;
+        int queue_escapes = 0;
+        int stall_episodes = 0;
+        double stall_total_seconds = 0.0;
+        double stall_max_seconds = 0.0;
+        int stall_over_250ms = 0;
+        int stall_over_500ms = 0;
+        int stall_over_1000ms = 0;
+        int stall_cast_tail = 0;
+        int stall_pending = 0;
+        int stall_suppression = 0;
+        int stall_apl_no_action = 0;
         int builder_resolved = 0;
         int builder_positive_delta = 0;
         int builder_gain_total = 0;
@@ -1077,6 +1257,17 @@ private:
         int chain_lightning_gain_normal = 0;
         int chain_lightning_gain_stormkeeper = 0;
         int chain_lightning_gain_swiftness = 0;
+        int trinket_sync_confirms = 0;
+        int trinket_sync_retries = 0;
+        int trinket_sync_failures = 0;
+        int maelstrom_packets_total = 0;
+        int maelstrom_packets_clean = 0;
+        int maelstrom_packets_ambiguous = 0;
+        int maelstrom_packets_timeout = 0;
+        int maelstrom_packets_overlap = 0;
+        // Direct comparison against the v2.3.4 first-delta observer.
+        int packet_first_sum = 0;
+        int packet_total_sum = 0;
     } telemetry_;
     bool telemetry_combat_active_ = false;
 
@@ -1111,6 +1302,22 @@ private:
     double ascendance_pending_until_ = -999.0;
     double trinket_1_pending_until_ = -999.0;
     double trinket_2_pending_until_ = -999.0;
+
+    // Mode-2 synchronization barrier. Runtime proved that a Titan-accepted item
+    // action is not proof the item was used, so the Major-CD package holds here
+    // until equipped-item state or a trinket spell event says otherwise.
+    struct MajorTrinketSync {
+        int slot = 0;
+        uint32_t item_id = 0;
+        double armed_at = -999.0;
+        double dispatched_at = -999.0;
+        int attempts = 0;
+    } major_trinket_sync_;
+    // Per-slot hold-off after a bounded failure so one bad press cannot loop the
+    // burst package. Cleared by combat reset or an equipment change.
+    double major_trinket_bypass_until_[2] = {-999.0, -999.0};
+    uint32_t major_trinket_bypass_item_[2] = {0, 0};
+
     struct GlobalLockState {
         bool locked = false;
         bool desync = false;
@@ -1296,11 +1503,38 @@ private:
     static constexpr double kMaintenanceAttemptWindow = 2.0;
     static constexpr double kGhostWolfMoveDelay = 1.0;
     static constexpr double kGhostWolfAttempt = 1.0;
-    static constexpr double kMaelstromAttributionWindow = 0.60;
-    // Four consecutive escapes with no cast start and no success event in
-    // between is not a transient miss; that spell is not reaching the game.
-    static constexpr int kExecutionBreakerEscapes = 4;
-    static constexpr double kExecutionBreakerWindow = 20.0;
+    // Titan publishes item data every 500 ms. The v2.3.4 log shows the working
+    // trinket press at 330954.04 first reported cooldown at 330954.60, so an
+    // item is not judged failed until a full publication interval has passed.
+    static constexpr double kTrinketSyncSettle = 0.60;
+    // Total time the burst package may hold waiting for a strictly free window
+    // before it gives up and proceeds without the item.
+    static constexpr double kTrinketSyncHoldMax = 2.50;
+    // Poll interval while the barrier holds the package.
+    static constexpr double kTrinketSyncPollMs = 80.0;
+    // Hold-off applied to a slot after the bounded failure path.
+    static constexpr double kTrinketSyncBypass = 30.0;
+    // Resource packets: a change may arrive one item/power publication after the
+    // previous one, so the quiet window must exceed the 250 ms power interval.
+    // 0.35 s covers one interval plus scheduling jitter.
+    static constexpr double kMaelstromPacketQuiet = 0.35;
+    // Hard lifetime. Measured spacing between resolved rotational actions in the
+    // v2.3.4 log has a median of 1.33 s, so 1.20 s closes a packet before the
+    // next action can normally contaminate it.
+    static constexpr double kMaelstromPacketMax = 1.20;
+    // Diagnostics only since v2.3.4. Measured escapes are frequently false, so
+    // reaching this count reports a suspect spell and never blocks it.
+    static constexpr int kExecutionSuspectEscapes = 4;
+    // A button sent into the queue window cannot start before the current cast
+    // ends, so its confirmation deadline grows by the remaining cast time.
+    static constexpr double kQueueGraceMax = 0.75;
+    // How long the finishing cast may still deliver its own success event after
+    // the dispatcher was handed to a queued button.
+    static constexpr double kPriorSuccessGrace = 1.50;
+    // Late-execution proof window for an escaped button.
+    static constexpr double kEscapeWatchWindow = 1.50;
+    // Idle ticks further apart than this belong to separate stall episodes.
+    static constexpr double kStallEpisodeGap = 0.50;
     static constexpr double kSharedLockMax = 1.50;
     static constexpr double kSharedLockCluster = 0.25;
 
@@ -1327,6 +1561,104 @@ private:
 
     void note_input_dispatch(const rotation_api::IRotationAPI& api) {
         last_input_dispatch_time_ = api.get_game_time();
+        // Any real button ends an idle episode, including setup actions that do
+        // not run through the damage dispatcher.
+        note_stall_end(api, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // STALL EPISODES
+    // -------------------------------------------------------------------------
+    // Transition based: one line when idling starts, one line when it ends,
+    // plus fixed scalar counters. Nothing is printed per tick.
+    void note_stall_tick(const rotation_api::IRotationAPI& api,
+                         const CombatState& state,
+                         bool moving,
+                         const std::string& snapshot)
+    {
+        const double now = api.get_game_time();
+        if (stall_active_) {
+            // Idle ticks must be contiguous. A gap means the rotation was doing
+            // something else (dead target, out of range, out of combat), which
+            // does not belong to this episode.
+            if ((now - stall_last_tick_at_) <= kStallEpisodeGap) {
+                stall_last_tick_at_ = now;
+                return;
+            }
+            finish_stall_episode(stall_last_tick_at_, 0);
+        }
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        stall_active_ = true;
+        stall_started_at_ = now;
+        stall_last_tick_at_ = now;
+        stall_begin_pending_ = damage_dispatch_.pending;
+        stall_begin_pending_spell_ = damage_dispatch_.spell_id;
+        stall_begin_suppressed_spell_ = damage_dispatch_.suppressed_spell_id;
+        stall_begin_moving_ = moving;
+        stall_begin_cast_tail_ = damage_dispatch_.pending &&
+            damage_dispatch_.cast_started_at > 0.0 && info.is_active();
+        if (!debug_diagnostics_) return;
+
+        std::ostringstream out;
+        out << "STALL_BEGIN v2.3.5"
+            << " time=" << format_seconds(stall_started_at_)
+            << " pending=" << (stall_begin_pending_ ? 1 : 0)
+            << " pending_spell=" << stall_begin_pending_spell_
+            << " cast_tail=" << (stall_begin_cast_tail_ ? 1 : 0)
+            << " cast=" << info.spell_id
+            << " cast_strict=" << (player_cast_active_strict(api) ? 1 : 0)
+            << " suppressed_spell=" << stall_begin_suppressed_spell_
+            << " last_success=" << (last_successful_damage_spell_.empty()
+                ? std::string("<none>") : last_successful_damage_spell_)
+            << " maelstrom=" << state.maelstrom
+            << " enemies=" << state.enemies
+            << ' ' << snapshot;
+        queue_damage_debug(out.str());
+    }
+
+    // Classified only from state that was actually captured when idling began.
+    const char* stall_classification() const {
+        if (stall_begin_moving_) return "movement";
+        if (stall_begin_cast_tail_) return "post_cast_tail";
+        if (stall_begin_pending_) return "pending_resolution";
+        if (stall_begin_suppressed_spell_ != 0) return "suppression";
+        return "apl_no_action";
+    }
+
+    void note_stall_end(const rotation_api::IRotationAPI& api, uint32_t next_spell_id) {
+        if (!stall_active_) return;
+        finish_stall_episode(api.get_game_time(), next_spell_id);
+    }
+
+    void finish_stall_episode(double ended_at, uint32_t next_spell_id) {
+        if (!stall_active_) return;
+        stall_active_ = false;
+        const double duration = std::max(0.0, ended_at - stall_started_at_);
+        const char* reason = stall_classification();
+
+        if (telemetry_combat_active_) {
+            ++telemetry_.stall_episodes;
+            telemetry_.stall_total_seconds += duration;
+            telemetry_.stall_max_seconds = std::max(telemetry_.stall_max_seconds, duration);
+            if (duration > 0.25) ++telemetry_.stall_over_250ms;
+            if (duration > 0.50) ++telemetry_.stall_over_500ms;
+            if (duration > 1.00) ++telemetry_.stall_over_1000ms;
+            if (stall_begin_cast_tail_) ++telemetry_.stall_cast_tail;
+            else if (stall_begin_pending_) ++telemetry_.stall_pending;
+            else if (stall_begin_suppressed_spell_ != 0) ++telemetry_.stall_suppression;
+            else ++telemetry_.stall_apl_no_action;
+        }
+
+        if (debug_diagnostics_) {
+            queue_damage_debug("STALL_END duration=" + format_seconds(duration) +
+                " next_spell=" + std::to_string(next_spell_id) +
+                " reason=" + reason);
+        }
+        stall_begin_pending_ = false;
+        stall_begin_cast_tail_ = false;
+        stall_begin_moving_ = false;
+        stall_begin_pending_spell_ = 0;
+        stall_begin_suppressed_spell_ = 0;
     }
 
     // -------------------------------------------------------------------------
@@ -1338,6 +1670,87 @@ private:
         damage_dispatch_.dispatched_at = -999.0;
         damage_dispatch_.cast_started_at = -999.0;
         damage_dispatch_.pending = false;
+        damage_dispatch_.queue_grace = 0.0;
+        damage_dispatch_.queued_send = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // SPELL QUEUE WINDOW
+    // -------------------------------------------------------------------------
+    // Titan 23.3 exposes the queue window through the optional argument on the
+    // casting queries plus get_rotation_spell_queue_window(). Passing true means
+    // "treat the tail of my own cast as free", which is Titan asking for the
+    // next button early. Strict state is the same query with false.
+    static bool player_cast_active_strict(const rotation_api::IRotationAPI& api) {
+        return api.unit_is_casting_or_channeling("player", false);
+    }
+
+    static bool player_free_for_queue(const rotation_api::IRotationAPI& api) {
+        return !api.unit_is_casting_or_channeling("player", true);
+    }
+
+    static bool in_spell_queue_window(const rotation_api::IRotationAPI& api) {
+        return player_cast_active_strict(api) && player_free_for_queue(api);
+    }
+
+    // Remaining time on the player's own cast, clamped to a sane bound so a
+    // stale CastInfo can never grant an unbounded confirmation extension.
+    static double player_cast_remaining(const rotation_api::IRotationAPI& api) {
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        if (!info.is_active()) return 0.0;
+        const double remaining = info.get_remaining(api.get_game_time());
+        if (!(remaining > 0.0)) return 0.0;
+        return std::min(remaining, kQueueGraceMax);
+    }
+
+    // The pending dispatch became a real cast that is now inside its queue
+    // window. Exactly one ordinary hardcast filler may be sent into it.
+    bool queue_release_available(const rotation_api::IRotationAPI& api, uint32_t spell_id) const {
+        if (!queue_window_casting_) return false;
+        if (!damage_dispatch_.pending) return false;
+        if (damage_dispatch_.cast_started_at <= 0.0) return false;
+        if (queued_for_cast_at_ == damage_dispatch_.cast_started_at) return false;
+        if (!in_spell_queue_window(api)) return false;
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        if (!info.is_active()) return false;
+        if (queued_prior_cast_start_ > 0.0 &&
+            std::abs(info.get_start_time() - queued_prior_cast_start_) < 0.05)
+        {
+            return false;
+        }
+        if (!logical_spell_match(api, damage_dispatch_.spell_id, info.spell_id)) return false;
+        return is_queueable_filler(api, spell_id);
+    }
+
+    // Only the two ordinary hardcast fillers. Spenders, ground targets, and
+    // setup actions keep the strict one-button-at-a-time model so no duplicate
+    // Earthquake, Elemental Blast, or cooldown can ever be queued.
+    bool is_queueable_filler(const rotation_api::IRotationAPI& api, uint32_t spell_id) const {
+        if (spell_id == 0) return false;
+        return (spellbook_.lightning_bolt != 0 &&
+                logical_spell_match(api, spellbook_.lightning_bolt, spell_id)) ||
+               (spellbook_.chain_lightning != 0 &&
+                logical_spell_match(api, spellbook_.chain_lightning, spell_id));
+    }
+
+    // Hands the dispatcher over from the finishing cast to the queued button.
+    // The finishing cast still owns its own success event, so that event is
+    // consumed once instead of confirming the newly queued dispatch.
+    void release_dispatcher_for_queue(const rotation_api::IRotationAPI& api) {
+        const double now = api.get_game_time();
+        queued_for_cast_at_ = damage_dispatch_.cast_started_at;
+        queued_prior_cast_start_ = current_cast_info(api, "player").get_start_time();
+        expected_prior_success_spell_ = damage_dispatch_.spell_id;
+        expected_prior_success_until_ = now + kPriorSuccessGrace;
+        if (telemetry_combat_active_) ++telemetry_.queue_releases;
+        if (debug_diagnostics_) {
+            queue_damage_debug("QUEUE_RELEASE cast=" +
+                std::to_string(damage_dispatch_.spell_id) + '/' +
+                api.get_spell_name(damage_dispatch_.spell_id) +
+                " remaining=" + format_seconds(player_cast_remaining(api)) +
+                " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
+        }
+        clear_damage_dispatch_pending();
     }
 
     void clear_damage_dispatch_suppression() {
@@ -1353,7 +1766,8 @@ private:
         last_damage_dispatch_log_time_ = -999.0;
         last_damage_suppressed_log_time_ = -999.0;
         last_unmatched_success_log_time_ = -999.0;
-        maelstrom_attribution_ = {};
+        maelstrom_packet_ = {};
+        maelstrom_request_ = {};
     }
 
     // One generic identity test. Titan can report a runtime/override ID that
@@ -1382,7 +1796,7 @@ private:
 
     void queue_damage_debug(std::string message) {
         if (!debug_diagnostics_) return;
-        if (damage_debug_messages_.size() >= 4) return;
+        if (damage_debug_messages_.size() >= 6) return;
         damage_debug_messages_.push_back(std::move(message));
     }
 
@@ -1413,10 +1827,10 @@ private:
         return false;
     }
 
-    // Opens one conservative attribution window when a rotational damage spell
-    // reports success, which is where the game actually grants or spends
-    // Maelstrom. Resource movement is measured, never assumed, and never feeds
-    // back into action selection.
+    // Requests one resource packet when a rotational damage spell reports
+    // success, which is where the game actually grants or spends Maelstrom.
+    // Resource movement is measured, never assumed, and never feeds back into
+    // action selection.
     void note_resolved_damage_action(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
         if (spell_id == 0) return;
         if (!is_rotation_damage_spell_id(spell_id) &&
@@ -1425,98 +1839,259 @@ private:
             return;
         }
 
-        // Two resolutions inside one window cannot be told apart safely.
-        if (maelstrom_attribution_.active) {
-            maelstrom_attribution_.ambiguous = true;
+        // Two resolutions before the observer ran: neither owner is provable.
+        if (maelstrom_request_.pending) {
+            maelstrom_request_.ambiguous = true;
+            maelstrom_request_.spell_id = spell_id;
             return;
         }
 
-        maelstrom_attribution_.active = true;
-        maelstrom_attribution_.ambiguous = false;
-        maelstrom_attribution_.spell_id = spell_id;
-        maelstrom_attribution_.spell_name = api.get_spell_name(spell_id);
-        maelstrom_attribution_.before = last_observed_maelstrom_ >= 0
-            ? last_observed_maelstrom_ : api.get_player_power("maelstrom");
-        maelstrom_attribution_.started_at = api.get_game_time();
-        maelstrom_attribution_.enemies = last_snapshot_enemies_;
-        maelstrom_attribution_.stormkeeper = has_buff_name(api, "player", "Stormkeeper");
-        maelstrom_attribution_.ancestral_swiftness = has_buff_name(api, "player", "Ancestral Swiftness");
-        maelstrom_attribution_.ascendance = has_buff_name(api, "player", "Ascendance");
-        maelstrom_attribution_.lust = has_lust_buff(api);
+        maelstrom_request_.pending = true;
+        maelstrom_request_.ambiguous = false;
+        maelstrom_request_.spell_id = spell_id;
+        maelstrom_request_.enemies = last_snapshot_enemies_;
+        maelstrom_request_.stormkeeper = has_buff_name(api, "player", "Stormkeeper");
+        maelstrom_request_.ancestral_swiftness =
+            has_buff_name(api, "player", "Ancestral Swiftness");
+        maelstrom_request_.ascendance = has_buff_name(api, "player", "Ascendance");
+        maelstrom_request_.lust = has_lust_buff(api);
     }
 
-    void tally_maelstrom_delta(const rotation_api::IRotationAPI& api,
-                               const MaelstromAttribution& attribution,
-                               int delta)
+    BuilderBucket builder_bucket(const rotation_api::IRotationAPI& api,
+                                 uint32_t spell_id) const
     {
-        if (!telemetry_combat_active_ || attribution.ambiguous) return;
-        if (!is_builder_spell(api, attribution.spell_id)) return;
+        if (spellbook_.lightning_bolt != 0 &&
+            logical_spell_match(api, spellbook_.lightning_bolt, spell_id))
+        {
+            return BuilderBucket::LightningBolt;
+        }
+        if (spellbook_.chain_lightning != 0 &&
+            logical_spell_match(api, spellbook_.chain_lightning, spell_id))
+        {
+            return BuilderBucket::ChainLightning;
+        }
+        if (spellbook_.lava_burst != 0 &&
+            logical_spell_match(api, spellbook_.lava_burst, spell_id))
+        {
+            return BuilderBucket::LavaBurst;
+        }
+        if (spellbook_.voltaic_blaze != 0 &&
+            logical_spell_match(api, spellbook_.voltaic_blaze, spell_id))
+        {
+            return BuilderBucket::VoltaicBlaze;
+        }
+        if (spellbook_.tempest != 0 &&
+            logical_spell_match(api, spellbook_.tempest, spell_id))
+        {
+            return BuilderBucket::Tempest;
+        }
+        return BuilderBucket::Other;
+    }
+
+    static const char* builder_bucket_name(BuilderBucket bucket) {
+        switch (bucket) {
+            case BuilderBucket::LightningBolt: return "LB";
+            case BuilderBucket::ChainLightning: return "CL";
+            case BuilderBucket::LavaBurst: return "LVB";
+            case BuilderBucket::VoltaicBlaze: return "VB";
+            case BuilderBucket::Tempest: return "TEMPEST";
+            case BuilderBucket::Other: return "OTHER";
+            case BuilderBucket::Count: break;
+        }
+        return "OTHER";
+    }
+
+    static const char* packet_context_name(PacketContext context) {
+        switch (context) {
+            case PacketContext::Normal: return "normal";
+            case PacketContext::Stormkeeper: return "sk";
+            case PacketContext::AncestralSwiftness: return "as";
+            case PacketContext::Ascendance: return "asc";
+            case PacketContext::Lust: return "lust";
+            case PacketContext::Count: break;
+        }
+        return "normal";
+    }
+
+    static int enemy_bucket_index(int enemies) {
+        return std::clamp(enemies, 1, kEnemyBuckets) - 1;
+    }
+
+    static PacketContext packet_context_of(const MaelstromPacket& packet) {
+        if (packet.stormkeeper) return PacketContext::Stormkeeper;
+        if (packet.ancestral_swiftness) return PacketContext::AncestralSwiftness;
+        if (packet.ascendance) return PacketContext::Ascendance;
+        if (packet.lust) return PacketContext::Lust;
+        return PacketContext::Normal;
+    }
+
+    // Only quiet-closed, unambiguous builder packets describe real generation.
+    void record_maelstrom_packet(const rotation_api::IRotationAPI& api,
+                                 const MaelstromPacket& packet,
+                                 bool clean)
+    {
+        if (!telemetry_combat_active_) return;
+        if (!is_builder_spell(api, packet.spell_id)) return;
+
+        const int bucket = static_cast<int>(builder_bucket(api, packet.spell_id));
+        const int enemies = enemy_bucket_index(packet.enemies);
+        if (!clean) {
+            ++packet_ambiguous_by_enemies_[bucket][enemies];
+            return;
+        }
 
         ++telemetry_.builder_resolved;
-        if (delta > 0) {
+        if (packet.positive_total > 0) {
             ++telemetry_.builder_positive_delta;
-            telemetry_.builder_gain_total += delta;
+            telemetry_.builder_gain_total += packet.positive_total;
+            telemetry_.packet_first_sum += packet.first_positive;
+            telemetry_.packet_total_sum += packet.positive_total;
+            packet_by_enemies_[bucket][enemies].add(packet.positive_total);
+            packet_by_context_[bucket][static_cast<int>(packet_context_of(packet))]
+                .add(packet.positive_total);
         }
 
-        if (spellbook_.lightning_bolt != 0 &&
-            logical_spell_match(api, spellbook_.lightning_bolt, attribution.spell_id))
-        {
+        if (bucket == static_cast<int>(BuilderBucket::LightningBolt)) {
             ++telemetry_.lightning_bolt_resolved;
-            if (delta > 0) telemetry_.lightning_bolt_gain += delta;
-        }
-
-        if (spellbook_.chain_lightning != 0 &&
-            logical_spell_match(api, spellbook_.chain_lightning, attribution.spell_id))
-        {
+            if (packet.positive_total > 0) {
+                telemetry_.lightning_bolt_gain += packet.positive_total;
+            }
+        } else if (bucket == static_cast<int>(BuilderBucket::ChainLightning)) {
             ++telemetry_.chain_lightning_resolved;
-            if (delta > 0) {
-                telemetry_.chain_lightning_gain += delta;
-                if (attribution.stormkeeper) {
-                    telemetry_.chain_lightning_gain_stormkeeper += delta;
-                } else if (attribution.ancestral_swiftness) {
-                    telemetry_.chain_lightning_gain_swiftness += delta;
+            if (packet.positive_total > 0) {
+                telemetry_.chain_lightning_gain += packet.positive_total;
+                if (packet.stormkeeper) {
+                    telemetry_.chain_lightning_gain_stormkeeper += packet.positive_total;
+                } else if (packet.ancestral_swiftness) {
+                    telemetry_.chain_lightning_gain_swiftness += packet.positive_total;
                 } else {
-                    telemetry_.chain_lightning_gain_normal += delta;
+                    telemetry_.chain_lightning_gain_normal += packet.positive_total;
                 }
             }
         }
     }
 
+    void apply_maelstrom_delta(int current, double now) {
+        if (!maelstrom_packet_.active) return;
+        const int delta = current - maelstrom_packet_.last;
+        if (delta == 0) return;
+        if (delta > 0) {
+            maelstrom_packet_.positive_total += delta;
+            if (maelstrom_packet_.first_positive == 0) {
+                maelstrom_packet_.first_positive = delta;
+            }
+        } else {
+            maelstrom_packet_.negative_total += delta;
+        }
+        maelstrom_packet_.last = current;
+        maelstrom_packet_.last_change_at = now;
+        ++maelstrom_packet_.changes;
+    }
+
+    void close_maelstrom_packet(const RotationContext& context,
+                                int current,
+                                double now,
+                                const char* close_reason,
+                                bool timed_out,
+                                bool overlapped)
+    {
+        const auto& api = context.api();
+        MaelstromPacket packet = maelstrom_packet_;
+        maelstrom_packet_ = {};
+        if (!packet.active) return;
+
+        // A builder that also lost resource, or a spender that also gained it,
+        // shared its window with something else.
+        const bool builder = is_builder_spell(api, packet.spell_id);
+        if (builder && packet.negative_total < 0) packet.ambiguous = true;
+        if (!builder && packet.positive_total > 0) packet.ambiguous = true;
+        if (overlapped) packet.ambiguous = true;
+
+        const bool clean = !packet.ambiguous && !timed_out && !overlapped;
+
+        if (telemetry_combat_active_) {
+            ++telemetry_.maelstrom_packets_total;
+            if (clean) ++telemetry_.maelstrom_packets_clean;
+            if (packet.ambiguous) ++telemetry_.maelstrom_packets_ambiguous;
+            if (timed_out) ++telemetry_.maelstrom_packets_timeout;
+            if (overlapped) ++telemetry_.maelstrom_packets_overlap;
+        }
+        record_maelstrom_packet(api, packet, clean);
+
+        if (!debug_diagnostics_) return;
+        if (packet.changes == 0) return;
+
+        std::ostringstream out;
+        out << "MAELSTROM_PACKET spell=" << packet.spell_id << '/'
+            << api.get_spell_name(packet.spell_id)
+            << " start=" << packet.start
+            << " end=" << current
+            << " first=" << packet.first_positive
+            << " positive_total=" << packet.positive_total
+            << " negative_total=" << packet.negative_total
+            << " enemies=" << packet.enemies
+            << " stormkeeper=" << (packet.stormkeeper ? 1 : 0)
+            << " ancestral_swiftness=" << (packet.ancestral_swiftness ? 1 : 0)
+            << " ascendance=" << (packet.ascendance ? 1 : 0)
+            << " lust=" << (packet.lust ? 1 : 0)
+            << " duration=" << format_seconds(now - packet.opened_at)
+            << " changes=" << packet.changes
+            << " ambiguous=" << (packet.ambiguous ? 1 : 0)
+            << " close=" << close_reason;
+        context.log(out.str());
+    }
+
+    // The baseline is the previous sample, not the current one, so resource that
+    // arrived between the two samples still belongs to the spell that resolved.
+    void open_maelstrom_packet(int baseline, double now, bool inherited_ambiguity) {
+        maelstrom_packet_ = {};
+        maelstrom_packet_.active = true;
+        maelstrom_packet_.ambiguous = inherited_ambiguity || maelstrom_request_.ambiguous;
+        maelstrom_packet_.spell_id = maelstrom_request_.spell_id;
+        maelstrom_packet_.start = baseline;
+        maelstrom_packet_.last = baseline;
+        maelstrom_packet_.opened_at = now;
+        maelstrom_packet_.last_change_at = now;
+        maelstrom_packet_.enemies = maelstrom_request_.enemies;
+        maelstrom_packet_.stormkeeper = maelstrom_request_.stormkeeper;
+        maelstrom_packet_.ancestral_swiftness = maelstrom_request_.ancestral_swiftness;
+        maelstrom_packet_.ascendance = maelstrom_request_.ascendance;
+        maelstrom_packet_.lust = maelstrom_request_.lust;
+        maelstrom_request_ = {};
+    }
+
+    // Single per-tick resource read, unchanged from v2.3.4. A newly resolved
+    // action owns the movement since the previous sample, not from current.
     void observe_maelstrom(const RotationContext& context) {
         const auto& api = context.api();
+        const int previous = last_observed_maelstrom_;
         const int current = api.get_player_power("maelstrom");
         const double now = api.get_game_time();
+        const bool have_previous = previous >= 0;
 
-        if (maelstrom_attribution_.active) {
-            const bool moved = current != maelstrom_attribution_.before;
+        if (maelstrom_request_.pending) {
+            // The previous packet never settled, so neither it nor its successor
+            // can claim delayed resource with confidence.
+            const bool overlapped = maelstrom_packet_.active;
+            if (overlapped) {
+                close_maelstrom_packet(context, have_previous ? previous : current,
+                    now, "overlap", false, true);
+            }
+            open_maelstrom_packet(have_previous ? previous : current, now, overlapped);
+            apply_maelstrom_delta(current, now);
+        } else {
+            apply_maelstrom_delta(current, now);
+        }
+
+        if (maelstrom_packet_.active) {
+            const bool quiet = maelstrom_packet_.changes > 0 &&
+                (now - maelstrom_packet_.last_change_at) >= kMaelstromPacketQuiet;
             const bool expired =
-                (now - maelstrom_attribution_.started_at) >= kMaelstromAttributionWindow;
-            if (moved || expired) {
-                const int delta = current - maelstrom_attribution_.before;
-                tally_maelstrom_delta(api, maelstrom_attribution_, delta);
-                if (debug_diagnostics_ && delta != 0) {
-                    std::ostringstream out;
-                    out << "MAELSTROM_DELTA spell=";
-                    if (maelstrom_attribution_.ambiguous) {
-                        out << "unknown";
-                    } else {
-                        out << maelstrom_attribution_.spell_id << '/'
-                            << (maelstrom_attribution_.spell_name.empty()
-                                    ? std::string("?")
-                                    : maelstrom_attribution_.spell_name);
-                    }
-                    out << " before=" << maelstrom_attribution_.before
-                        << " after=" << current
-                        << " delta=" << (delta > 0 ? "+" : "") << delta
-                        << " enemies=" << maelstrom_attribution_.enemies
-                        << " stormkeeper=" << (maelstrom_attribution_.stormkeeper ? 1 : 0)
-                        << " ancestral_swiftness="
-                        << (maelstrom_attribution_.ancestral_swiftness ? 1 : 0)
-                        << " ascendance=" << (maelstrom_attribution_.ascendance ? 1 : 0)
-                        << " lust=" << (maelstrom_attribution_.lust ? 1 : 0);
-                    context.log(out.str());
-                }
-                maelstrom_attribution_ = {};
+                (now - maelstrom_packet_.opened_at) >= kMaelstromPacketMax;
+            if (quiet) {
+                close_maelstrom_packet(context, current, now, "quiet", false, false);
+            } else if (expired) {
+                close_maelstrom_packet(context, current, now, "timeout", true, false);
             }
         }
 
@@ -1581,7 +2156,20 @@ private:
             << " charges=" << api.get_spell_current_charges(spell_id)
             << '/' << api.get_spell_max_charges(spell_id)
             << " castable=" << (api.can_cast_spell(spell_id) ? 1 : 0)
-            << " escapes=" << (suspect ? execution_suspect_escapes_ : 0);
+            << " escapes=" << (suspect ? execution_suspect_escapes_ : 0)
+            // Queue-window context: what the game was busy with when the button
+            // was sent, and how much extra confirmation time that bought.
+            << " qwin=" << (dispatch_probe_.queue_window_at_dispatch ? 1 : 0)
+            << " qbehind=" << dispatch_probe_.cast_at_dispatch
+            << " qgrace=" << format_seconds(damage_dispatch_.queue_grace)
+            << " cast_strict=" << (player_cast_active_strict(api) ? 1 : 0)
+            << " cd=" << format_seconds(api.get_spell_cooldown_remaining(spell_id))
+            << " guid=" << (damage_dispatch_.target_guid.empty()
+                ? std::string("<none>") : damage_dispatch_.target_guid)
+            << " same_target=" << ((api.unit_exists("target") &&
+                api.get_unit_guid("target") == damage_dispatch_.target_guid) ? 1 : 0)
+            << " suppress=" << ((result == DispatchResult::Escaped)
+                ? format_seconds(kDamageDispatchEscapeWindow) : format_seconds(0.0));
         queue_damage_debug(out.str());
     }
 
@@ -1603,17 +2191,16 @@ private:
             if (telemetry_combat_active_ && lava_burst) ++telemetry_.lava_burst_escaped;
             log_dispatch_result(api, result);
 
-            if (!execution_blocked_ && execution_suspect_escapes_ >= kExecutionBreakerEscapes) {
-                execution_blocked_ = true;
-                execution_block_until_ = api.get_game_time() + kExecutionBreakerWindow;
+            // Report only. A working spell must never be parked: runtime shows
+            // escapes that were merely late queued executions.
+            if (execution_suspect_escapes_ == kExecutionSuspectEscapes) {
                 execution_break_message_ =
-                    "EXECUTION_BREAKER spell=" + std::to_string(spell_id) + "/" +
+                    "EXECUTION_SUSPECT spell=" + std::to_string(spell_id) + "/" +
                     api.get_spell_name(spell_id) +
                     " key=" + spell_keybind_text(api, spell_id) +
-                    " reason=no cast start and no success after " +
-                    std::to_string(execution_suspect_escapes_) +
-                    " dispatches; skipping it for " +
-                    format_seconds(kExecutionBreakerWindow) + "s";
+                    " escapes=" + std::to_string(execution_suspect_escapes_) +
+                    " reason=no cast start and no success event; check this binding"
+                    " (diagnostic only, the spell is not blocked)";
             }
             return;
         }
@@ -1627,28 +2214,9 @@ private:
             if (suspect_match) {
                 execution_suspect_spell_ = 0;
                 execution_suspect_escapes_ = 0;
-                execution_blocked_ = false;
-                execution_block_until_ = -999.0;
             }
         }
         log_dispatch_result(api, result);
-    }
-
-    // Bounded: the block always expires, and expiry allows one probe dispatch
-    // so a rebind or a fixed binding recovers on its own.
-    bool damage_execution_blocked(const rotation_api::IRotationAPI& api, uint32_t spell_id) {
-        if (!execution_blocked_ || execution_suspect_spell_ == 0) return false;
-        if (!logical_spell_match(api, execution_suspect_spell_, spell_id)) return false;
-        if (api.get_game_time() >= execution_block_until_) {
-            // One retry probe. A single further escape re-trips immediately.
-            execution_blocked_ = false;
-            execution_suspect_escapes_ = kExecutionBreakerEscapes - 1;
-            return false;
-        }
-        if (telemetry_combat_active_ && is_lava_burst_id(api, spell_id)) {
-            ++telemetry_.lava_burst_blocked;
-        }
-        return true;
     }
 
     // Success events are authoritative, which matters most for instants that
@@ -1657,8 +2225,12 @@ private:
         const double now = api.get_game_time();
         queue_damage_debug("DAMAGE_CONFIRMED spell=" +
             std::to_string(damage_dispatch_.spell_id) +
-            " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
-        if (telemetry_combat_active_) ++telemetry_.damage_confirmed;
+            " age=" + format_seconds(now - damage_dispatch_.dispatched_at) +
+            " queued=" + (damage_dispatch_.queued_send ? "1" : "0"));
+        if (telemetry_combat_active_) {
+            ++telemetry_.damage_confirmed;
+            if (damage_dispatch_.queued_send) ++telemetry_.queue_confirmed;
+        }
         note_resolved_damage_action(api, damage_dispatch_.spell_id);
         note_dispatch_resolution(api, DispatchResult::SuccessHistory);
         clear_damage_dispatch_pending();
@@ -1689,7 +2261,15 @@ private:
         }
 
         const rotation_api::CastInfo info = current_cast_info(api, "player");
-        if (info.is_active() &&
+
+        // A button queued behind a same-name cast must not inherit that cast's
+        // bar as its own start. Only a genuinely new cast instance counts.
+        const bool finishing_prior_cast = queued_prior_cast_start_ > 0.0 &&
+            info.is_active() &&
+            std::abs(info.get_start_time() - queued_prior_cast_start_) < 0.05;
+        if (!finishing_prior_cast) queued_prior_cast_start_ = -999.0;
+
+        if (info.is_active() && !finishing_prior_cast &&
             logical_spell_match(api, damage_dispatch_.spell_id, info.spell_id))
         {
             if (damage_dispatch_.cast_started_at < 0.0) {
@@ -1710,14 +2290,28 @@ private:
             return;
         }
 
-        if ((now - damage_dispatch_.dispatched_at) < kDamageDispatchConfirmWindow) return;
+        // A button sent inside a cast's queue window cannot be executed by the
+        // game until that cast finishes, so its deadline includes that wait.
+        const double deadline = kDamageDispatchConfirmWindow + damage_dispatch_.queue_grace;
+        if ((now - damage_dispatch_.dispatched_at) < deadline) return;
 
         queue_damage_debug("DAMAGE_DISPATCH_ESCAPE spell=" +
             std::to_string(damage_dispatch_.spell_id) +
             " target=" + api.get_unit_name("target") +
-            " age=" + format_seconds(now - damage_dispatch_.dispatched_at));
-        if (telemetry_combat_active_) ++telemetry_.damage_escapes;
+            " age=" + format_seconds(now - damage_dispatch_.dispatched_at) +
+            " queued=" + (damage_dispatch_.queued_send ? "1" : "0"));
+        if (telemetry_combat_active_) {
+            ++telemetry_.damage_escapes;
+            if (damage_dispatch_.queued_send) ++telemetry_.queue_escapes;
+        }
         note_dispatch_resolution(api, DispatchResult::Escaped);
+
+        // Rare path: watch for the button executing after the deadline. That
+        // proves the input reached the game and the escape was false.
+        escape_watch_spell_ = damage_dispatch_.spell_id;
+        escape_watch_dispatched_at_ = damage_dispatch_.dispatched_at;
+        escape_watch_until_ = now + kEscapeWatchWindow;
+
         damage_dispatch_.suppressed_spell_id = damage_dispatch_.spell_id;
         damage_dispatch_.suppressed_target_guid = damage_dispatch_.target_guid;
         damage_dispatch_.suppressed_until = now + kDamageDispatchEscapeWindow;
@@ -1775,11 +2369,22 @@ private:
         // timestamp always survives and the confirmation window can expire.
         if (damage_dispatch_.pending) return;
 
+        // A cast that is still finishing holds the game's spell queue, so the
+        // confirmation deadline has to include the rest of that cast. Both cast
+        // signals must agree: CastInfo alone can linger after a cast completed.
+        const rotation_api::CastInfo active = current_cast_info(api, "player");
+        const bool queue_window = in_spell_queue_window(api);
+        const double queued_behind = (queue_window && active.is_active())
+            ? std::max(0.0, std::min(active.get_remaining(now), kQueueGraceMax))
+            : 0.0;
+
         damage_dispatch_.spell_id = spell_id;
         damage_dispatch_.target_guid = guid;
         damage_dispatch_.dispatched_at = now;
         damage_dispatch_.cast_started_at = -999.0;
         damage_dispatch_.pending = true;
+        damage_dispatch_.queue_grace = queued_behind;
+        damage_dispatch_.queued_send = queued_behind > 0.0;
 
         // Cheap scalars only. These describe the conditions the button was
         // sent under so a later escape can be explained instead of guessed.
@@ -1787,6 +2392,8 @@ private:
         dispatch_probe_.locked_at_dispatch = last_global_lock_.locked;
         dispatch_probe_.instant_expected = has_buff_name(api, "player", "Lava Surge") &&
             is_lava_burst_id(api, spell_id);
+        dispatch_probe_.queue_window_at_dispatch = queue_window;
+        dispatch_probe_.cast_at_dispatch = active.spell_id;
         dispatch_probe_.success_index_at_dispatch = api.get_last_spellcast_succeeded_index();
 
         if (telemetry_combat_active_) {
@@ -1858,7 +2465,7 @@ private:
         if (!eligible) return no_action("Unavailable");
         pending_until = now + kSetupPendingWindow;
         last_dispatch_time = now;
-        last_input_dispatch_time_ = now;
+        note_input_dispatch(api);
         return spell(spell_id, "player", reason);
     }
 
@@ -2397,7 +3004,39 @@ private:
             const bool rotational_damage_event =
                 is_rotation_damage_spell_name(name) || is_rotation_damage_spell_id(event.spell_id);
 
-            if (damage_dispatch_.pending) {
+            // An escaped button that executes late proves the input reached the
+            // game and the escape was a confirmation-timing artifact.
+            if (escape_watch_spell_ != 0) {
+                if (event.time > escape_watch_until_) {
+                    escape_watch_spell_ = 0;
+                } else if (logical_spell_match(api, escape_watch_spell_, event.spell_id)) {
+                    if (telemetry_combat_active_) ++telemetry_.escape_late_success;
+                    if (debug_diagnostics_) {
+                        queue_damage_debug("ESCAPE_LATE_SUCCESS spell=" +
+                            std::to_string(event.spell_id) + '/' + name +
+                            " delay=" + format_seconds(event.time - escape_watch_dispatched_at_));
+                    }
+                    escape_watch_spell_ = 0;
+                }
+            }
+
+            // The cast that handed the dispatcher to a queued button still owns
+            // its own success event. Consume it once so it cannot confirm the
+            // queued dispatch instead.
+            bool consumed_prior_success = false;
+            if (expected_prior_success_spell_ != 0) {
+                if (event.time > expected_prior_success_until_) {
+                    expected_prior_success_spell_ = 0;
+                } else if (logical_spell_match(api, expected_prior_success_spell_, event.spell_id)) {
+                    expected_prior_success_spell_ = 0;
+                    consumed_prior_success = true;
+                    if (rotational_damage_event) note_resolved_damage_action(api, event.spell_id);
+                }
+            }
+
+            if (consumed_prior_success) {
+                // Sequencing and Maelstrom attribution already handled above.
+            } else if (damage_dispatch_.pending) {
                 if (logical_spell_match(api, damage_dispatch_.spell_id, event.spell_id)) {
                     confirm_damage_dispatch(api);
                 } else if (rotational_damage_event) {
@@ -2426,6 +3065,55 @@ private:
         last_processed_success_index_ = highest_seen;
     }
 
+    void reset_packet_statistics() {
+        for (int spell = 0; spell < kBuilderBuckets; ++spell) {
+            for (int enemies = 0; enemies < kEnemyBuckets; ++enemies) {
+                packet_by_enemies_[spell][enemies] = {};
+                packet_ambiguous_by_enemies_[spell][enemies] = 0;
+            }
+            for (int flavor = 0; flavor < kPacketContexts; ++flavor) {
+                packet_by_context_[spell][flavor] = {};
+            }
+        }
+    }
+
+    // One compact line per populated bucket, emitted only at combat end.
+    void log_packet_summary(const RotationContext& context) const {
+        for (int spell = 0; spell < kBuilderBuckets; ++spell) {
+            const char* spell_name = builder_bucket_name(static_cast<BuilderBucket>(spell));
+            for (int enemies = 0; enemies < kEnemyBuckets; ++enemies) {
+                const PacketStat& stat = packet_by_enemies_[spell][enemies];
+                const int ambiguous = packet_ambiguous_by_enemies_[spell][enemies];
+                if (stat.count == 0 && ambiguous == 0) continue;
+                std::ostringstream out;
+                out << "MS_PKT_" << spell_name << '_' << (enemies + 1)
+                    << (enemies + 1 == kEnemyBuckets ? "plus" : "")
+                    << " n=" << stat.count
+                    << std::fixed << std::setprecision(1)
+                    << " avg=" << stat.average()
+                    << " min=" << stat.min
+                    << " max=" << stat.max
+                    << " ewma=" << stat.ewma
+                    << " ambiguous=" << ambiguous;
+                context.log(out.str());
+            }
+            for (int flavor = 0; flavor < kPacketContexts; ++flavor) {
+                const PacketStat& stat = packet_by_context_[spell][flavor];
+                if (stat.count == 0) continue;
+                std::ostringstream out;
+                out << "MS_PKT_" << spell_name << '_'
+                    << packet_context_name(static_cast<PacketContext>(flavor))
+                    << " n=" << stat.count
+                    << std::fixed << std::setprecision(1)
+                    << " avg=" << stat.average()
+                    << " min=" << stat.min
+                    << " max=" << stat.max
+                    << " ewma=" << stat.ewma;
+                context.log(out.str());
+            }
+        }
+    }
+
     void update_combat_telemetry(const RotationContext& context) {
         const auto& api = context.api();
         const double now = api.get_game_time();
@@ -2433,6 +3121,7 @@ private:
 
         if (in_combat && !telemetry_combat_active_) {
             telemetry_ = {};
+            reset_packet_statistics();
             telemetry_.started_at = now;
             telemetry_.last_sample_at = now;
             telemetry_combat_active_ = true;
@@ -2456,11 +3145,14 @@ private:
         }
 
         if (!in_combat && telemetry_combat_active_) {
+            // An episode still open at combat end is counted up to its last
+            // idle tick, never up to the moment combat dropped.
+            if (stall_active_) finish_stall_episode(stall_last_tick_at_, 0);
             const double duration = std::max(0.0, now - telemetry_.started_at);
             if (duration >= 3.0) {
                 std::ostringstream report;
                 report << std::fixed << std::setprecision(1)
-                    << "ELEMENTAL REPORT v2.3.3 duration=" << duration << "s"
+                    << "ELEMENTAL REPORT v2.3.5 duration=" << duration << "s"
                     << " casts=" << telemetry_.successful_casts
                     << " idle=" << telemetry_.gcd_idle_seconds << "s"
                     << " near_cap=" << telemetry_.near_cap_seconds << "s"
@@ -2482,12 +3174,27 @@ private:
                     << " lvb_confirmed=" << telemetry_.lava_burst_confirmed
                     << " lvb_cast_started=" << telemetry_.lava_burst_cast_started
                     << " lvb_escaped=" << telemetry_.lava_burst_escaped
-                    << " lvb_blocked=" << telemetry_.lava_burst_blocked
                     << " dmg_dispatches=" << telemetry_.damage_dispatches
                     << " dmg_started=" << telemetry_.damage_started
                     << " dmg_confirmed=" << telemetry_.damage_confirmed
                     << " dmg_escapes=" << telemetry_.damage_escapes
+                    << " dmg_escapes_late_success=" << telemetry_.escape_late_success
                     << " dmg_suppressed=" << telemetry_.damage_suppressed
+                    << " queue_releases=" << telemetry_.queue_releases
+                    << " queue_confirmed=" << telemetry_.queue_confirmed
+                    << " queue_escapes=" << telemetry_.queue_escapes
+                    << " stall_episodes=" << telemetry_.stall_episodes
+                    << " stall_total_seconds=" << std::setprecision(2)
+                    << telemetry_.stall_total_seconds
+                    << " stall_max_seconds=" << telemetry_.stall_max_seconds
+                    << std::setprecision(1)
+                    << " stall_over_250ms=" << telemetry_.stall_over_250ms
+                    << " stall_over_500ms=" << telemetry_.stall_over_500ms
+                    << " stall_over_1000ms=" << telemetry_.stall_over_1000ms
+                    << " stall_cast_tail=" << telemetry_.stall_cast_tail
+                    << " stall_pending=" << telemetry_.stall_pending
+                    << " stall_suppression=" << telemetry_.stall_suppression
+                    << " stall_apl_no_action=" << telemetry_.stall_apl_no_action
                     << " builder_resolved=" << telemetry_.builder_resolved
                     << " builder_positive_delta=" << telemetry_.builder_positive_delta
                     << " builder_gain_total=" << telemetry_.builder_gain_total
@@ -2497,10 +3204,22 @@ private:
                     << " cl_gain=" << telemetry_.chain_lightning_gain
                     << " cl_gain_normal=" << telemetry_.chain_lightning_gain_normal
                     << " cl_gain_stormkeeper=" << telemetry_.chain_lightning_gain_stormkeeper
-                    << " cl_gain_ancestral_swiftness=" << telemetry_.chain_lightning_gain_swiftness;
+                    << " cl_gain_ancestral_swiftness=" << telemetry_.chain_lightning_gain_swiftness
+                    << " trinket_sync_confirms=" << telemetry_.trinket_sync_confirms
+                    << " trinket_sync_retries=" << telemetry_.trinket_sync_retries
+                    << " trinket_sync_failures=" << telemetry_.trinket_sync_failures
+                    << " maelstrom_packets_total=" << telemetry_.maelstrom_packets_total
+                    << " maelstrom_packets_clean=" << telemetry_.maelstrom_packets_clean
+                    << " maelstrom_packets_ambiguous=" << telemetry_.maelstrom_packets_ambiguous
+                    << " maelstrom_packets_timeout=" << telemetry_.maelstrom_packets_timeout
+                    << " maelstrom_packets_overlap=" << telemetry_.maelstrom_packets_overlap
+                    << " packet_first_sum=" << telemetry_.packet_first_sum
+                    << " packet_total_sum=" << telemetry_.packet_total_sum;
                 context.log(report.str());
+                log_packet_summary(context);
             }
             telemetry_combat_active_ = false;
+            clear_major_trinket_sync();
             clear_damage_dispatch_state();
         }
     }
@@ -2936,14 +3655,15 @@ private:
         }
         // An unresolved dispatch owns the damage dispatcher. No tracked damage
         // action - the same spell or a different one - may be sent until it
-        // confirms, starts casting, invalidates, or escapes.
+        // confirms, starts casting, invalidates, or escapes. The one exception
+        // is the spell queue window of the dispatch's own hardcast, where Titan
+        // reports the player free precisely so the next filler can be queued.
+        bool release_for_queue = false;
         if (track_dispatch && damage_dispatch_.pending) {
-            return no_action("Damage dispatch pending");
-        }
-        // A spell that has repeatedly been accepted by the executor without
-        // ever reaching the game must stop consuming the dispatcher.
-        if (track_dispatch && damage_execution_blocked(api, spell_id)) {
-            return no_action("Spell not executing");
+            if (!queue_release_available(api, spell_id)) {
+                return no_action("Damage dispatch pending");
+            }
+            release_for_queue = true;
         }
         if (track_dispatch && damage_dispatch_suppressed(api, spell_id, unit)) {
             note_damage_suppressed(api, spell_id);
@@ -2952,6 +3672,8 @@ private:
         if (check_range && !damage_spell_in_range(api, spell_id, unit, true)) {
             return no_action("Out of range");
         }
+        if (release_for_queue) release_dispatcher_for_queue(api);
+        note_stall_end(api, spell_id);
         note_input_dispatch(api);
         if (track_dispatch) record_damage_dispatch(api, spell_id, unit);
         return spell(spell_id, unit, reason);
@@ -3148,6 +3870,17 @@ private:
     // Defensive order intentionally goes from major instant mitigation to an
     // emergency heal. Listed dangerous casts can trigger mitigation before the
     // hit lands; ordinary HP thresholds remain available as the fallback.
+    // Cheap gate for the pre-dispatcher survival layer. Only a genuinely low
+    // player pays for the extra snapshot; the predictive branches keep running
+    // in the normal order with the tick's real state.
+    bool emergency_defensive_possible(const rotation_api::IRotationAPI& api) const {
+        if (!api.is_toggle_enabled("Defensives")) return false;
+        const double gate = std::min(100.0,
+            std::max({astral_shift_hp_, stone_bulwark_hp_, emergency_heal_hp_,
+                      earth_elemental_hp_}) + 15.0);
+        return api.get_unit_health_percent("player") <= gate;
+    }
+
     RotationAction defensive_action(const rotation_api::IRotationAPI& api, const CombatState& state) {
         if (!api.is_toggle_enabled("Defensives")) return no_action("Defensives disabled");
 
@@ -3866,7 +4599,7 @@ private:
         const double now = api.get_game_time();
         const rotation_api::CastInfo info = current_cast_info(api, "player");
         std::ostringstream out;
-        out << "DBG_CAST v2.3.3 spell="
+        out << "DBG_CAST v2.3.5 spell="
             << (info.name.empty() ? "<empty>" : info.name)
             << '#' << info.spell_id
             << " active=" << debug_bool(info.is_active())
@@ -3883,7 +4616,7 @@ private:
     {
         const bool exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "NO_TARGET v2.3.3 name="
+        out << "NO_TARGET v2.3.5 name="
             << (exists ? api.get_unit_name("target") : "<none>")
             << " exists=" << debug_bool(exists)
             << " dead=" << debug_bool(exists && api.unit_is_dead("target"))
@@ -3901,7 +4634,11 @@ private:
                                    const std::string& prefix) const
     {
         std::ostringstream out;
-        out << prefix << " v2.3.3"
+        out << prefix << " v2.3.5"
+            << " pend=" << debug_bool(damage_dispatch_.pending)
+            << '/' << damage_dispatch_.spell_id
+            << " supp=" << damage_dispatch_.suppressed_spell_id
+            << " qwin=" << debug_bool(in_spell_queue_window(api))
             << " gcd=" << std::fixed << std::setprecision(2) << api.get_remaining_gcd()
             << " lock=" << (state.gcd_desync ? "desync" : (state.global_lock ? "gcd" : "0"))
             << "/" << std::setprecision(2) << state.global_lock_remaining
@@ -3921,7 +4658,15 @@ private:
     {
         const bool target_exists = api.unit_exists("target");
         std::ostringstream out;
-        out << "DBG v2.3.3 target="
+        // Queue window sizes come straight from Titan so the next log can show
+        // what it actually grants instead of an assumed value.
+        out << "DBG v2.3.5"
+            << " q=" << std::fixed << std::setprecision(2)
+            << api.get_rotation_spell_queue_window()
+            << '/' << api.get_in_game_spell_queue_window()
+            << " qwin=" << debug_bool(in_spell_queue_window(api))
+            << " qcast=" << debug_bool(queue_window_casting_)
+            << " target="
             << (target_exists ? api.get_unit_name("target") : "<none>")
             << "[ex" << debug_bool(target_exists)
             << ",dead" << debug_bool(target_exists && api.unit_is_dead("target"))
@@ -4063,7 +4808,8 @@ private:
 
     RotationAction use_trinket_slot(const rotation_api::IRotationAPI& api,
                                     int slot,
-                                    const std::string& reason)
+                                    const std::string& reason,
+                                    bool bypass_attempt_latch = false)
     {
         if (trinket_slot_broken(slot)) return no_action("Trinket slot broken");
         const auto equipped = equipped_trinket(api, slot);
@@ -4087,7 +4833,10 @@ private:
         double& pending_until = slot == 1 ? trinket_1_pending_until_ : trinket_2_pending_until_;
         const double last_success = slot == 1 ? last_trinket_1_success_time_ : last_trinket_2_success_time_;
         const double last_attempt = slot == 1 ? last_trinket_1_attempt_time_ : last_trinket_2_attempt_time_;
-        if (setup_action_blocked(0x80000000u + static_cast<uint32_t>(slot),
+        // The synchronization barrier owns its own timing evidence, so a
+        // verified failed press is allowed one retry inside the attempt latch.
+        if (!bypass_attempt_latch &&
+            setup_action_blocked(0x80000000u + static_cast<uint32_t>(slot),
                 pending_until, last_success, kTrinketSettle,
                 last_attempt, kTrinketAttempt, now, true)) {
             return no_action("Trinket settling");
@@ -4107,7 +4856,7 @@ private:
         if (slot == 1) last_trinket_1_attempt_time_ = now;
         else last_trinket_2_attempt_time_ = now;
         pending_until = now + kSetupPendingWindow;
-        last_input_dispatch_time_ = now;
+        note_input_dispatch(api);
 
         const std::string note = reason + " - slot " + std::to_string(slot) +
             " " + equipped->item_name;
@@ -4167,21 +4916,189 @@ private:
         return no_action("No independent trinket");
     }
 
-    // Mode 2 is inserted directly into the Major package before other setup
-    // buttons and Ascendance, maximizing buff overlap without hardcoding item
-    // IDs. Each active slot is consumed on its own decision tick.
+    // Runtime evidence for the barrier below (v2.3.4 log, Emberwing Feather):
+    //   330954.04 item pressed with no cast active -> 330954.60 cd119.5 (used)
+    //   331078.39 item pressed 0.42 s before a Chain Lightning cast completed
+    //             -> can1/cd0.0 for the remaining 23 s of the log (never used)
+    // Titan reported [OK] both times, so only equipped-item state or a trinket
+    // spell event can prove activation.
+    bool major_trinket_activated(const rotation_api::IRotationAPI& api,
+                                 int slot,
+                                 const rotation_api::EquippedItem& equipped) const
+    {
+        const double last_success = slot == 1
+            ? last_trinket_1_success_time_ : last_trinket_2_success_time_;
+        if (last_success > 0.0 && last_success >= major_trinket_sync_.dispatched_at - 0.05) {
+            return true;
+        }
+        if (equipped.cooldown.get_remaining(api.get_game_time()) > 0.0) return true;
+        // The barrier only arms while the item reports can_use(), so losing that
+        // state without an equipment change is consistent with activation.
+        return !equipped.can_use();
+    }
+
+    // An item press only reaches the game when the player is genuinely idle.
+    // Both cast signals are required: the failing press happened while strict
+    // casting already reported free and CastInfo still showed the cast running.
+    static bool trinket_press_window_open(const rotation_api::IRotationAPI& api) {
+        if (player_cast_active_strict(api)) return false;
+        const rotation_api::CastInfo info = current_cast_info(api, "player");
+        if (!info.is_active()) return true;
+        // A CastInfo bar with no time left is stale and must not hold the item.
+        return info.get_remaining(api.get_game_time()) <= 0.0;
+    }
+
+    void clear_major_trinket_sync() {
+        major_trinket_sync_ = {};
+    }
+
+    void log_trinket_sync_failure(const rotation_api::IRotationAPI& api,
+                                  int slot,
+                                  const rotation_api::EquippedItem* equipped,
+                                  const char* cause)
+    {
+        if (telemetry_combat_active_) ++telemetry_.trinket_sync_failures;
+        if (!debug_diagnostics_) return;
+        const double now = api.get_game_time();
+        std::ostringstream out;
+        out << "TRINKET_SYNC_FAIL slot=" << slot
+            << " item=" << (equipped ? equipped->item_id : major_trinket_sync_.item_id)
+            << '/' << (equipped ? equipped->item_name : std::string("<gone>"))
+            << " cause=" << cause
+            << " attempts=" << major_trinket_sync_.attempts
+            << " elapsed=" << format_seconds(now - major_trinket_sync_.armed_at)
+            << " since_press=" << format_seconds(now - major_trinket_sync_.dispatched_at)
+            << " bind=" << debug_bool(equipped && api.has_item_keybind(equipped->item_id))
+            << " can_use=" << debug_bool(equipped && equipped->can_use())
+            << " usable=" << debug_bool(equipped && equipped->is_usable)
+            << " cd=" << format_seconds(equipped
+                    ? equipped->cooldown.get_remaining(now) : 0.0)
+            << " cast_strict=" << debug_bool(player_cast_active_strict(api))
+            << " cast_info=" << debug_bool(current_cast_info(api, "player").is_active());
+        queue_damage_debug(out.str());
+    }
+
+    // Bounded failure: the slot stops holding the package, but nothing is marked
+    // broken. A missed press is not a missing keybind.
+    RotationAction abandon_major_trinket(const rotation_api::IRotationAPI& api,
+                                         const rotation_api::EquippedItem* equipped,
+                                         const char* cause)
+    {
+        const int slot = major_trinket_sync_.slot;
+        if (slot == 1 || slot == 2) {
+            log_trinket_sync_failure(api, slot, equipped, cause);
+            major_trinket_bypass_until_[slot - 1] = api.get_game_time() + kTrinketSyncBypass;
+            major_trinket_bypass_item_[slot - 1] = major_trinket_sync_.item_id;
+        }
+        clear_major_trinket_sync();
+        return no_action("Trinket sync abandoned");
+    }
+
+    bool major_trinket_bypassed(int slot, uint32_t item_id, double now) const {
+        const int index = slot - 1;
+        if (index < 0 || index > 1) return false;
+        if (major_trinket_bypass_item_[index] != item_id) return false;
+        return now < major_trinket_bypass_until_[index];
+    }
+
+    // Mode 2 is a synchronization barrier, not a suggestion. The Major package
+    // does not advance to Nature's Swiftness, racials, or Ascendance until the
+    // item is proven active, retried once, or written off.
     RotationAction major_synced_trinket_action(const rotation_api::IRotationAPI& api,
                                                const CombatState& state)
     {
+        const double now = api.get_game_time();
+
+        if (major_trinket_sync_.slot != 0) {
+            const int slot = major_trinket_sync_.slot;
+            const auto equipped = equipped_trinket(api, slot);
+            if (!equipped || !equipped->is_valid() ||
+                equipped->item_id != major_trinket_sync_.item_id)
+            {
+                clear_major_trinket_sync();
+                return no_action("Trinket changed during sync");
+            }
+
+            if (major_trinket_activated(api, slot, *equipped)) {
+                if (telemetry_combat_active_) ++telemetry_.trinket_sync_confirms;
+                if (debug_diagnostics_) {
+                    queue_damage_debug("TRINKET_SYNC_OK slot=" + std::to_string(slot) +
+                        " item=" + std::to_string(equipped->item_id) +
+                        " attempts=" + std::to_string(major_trinket_sync_.attempts) +
+                        " delay=" + format_seconds(now - major_trinket_sync_.dispatched_at) +
+                        " cd=" + format_seconds(equipped->cooldown.get_remaining(now)));
+                }
+                clear_major_trinket_sync();
+                return no_action("Trinket confirmed");
+            }
+
+            if ((now - major_trinket_sync_.armed_at) >= kTrinketSyncHoldMax) {
+                return abandon_major_trinket(api, &*equipped,
+                    major_trinket_sync_.attempts >= 2 ? "retry_failed" : "hold_expired");
+            }
+
+            // Titan publishes item data every 500 ms, so a press is not judged
+            // until a full publication interval has passed.
+            if ((now - major_trinket_sync_.dispatched_at) < kTrinketSyncSettle) {
+                return wait_action(kTrinketSyncPollMs, "TRINKET_SYNC_SETTLE");
+            }
+
+            if (major_trinket_sync_.attempts >= 2) {
+                return abandon_major_trinket(api, &*equipped, "retry_failed");
+            }
+
+            if (!trinket_press_window_open(api)) {
+                return wait_action(kTrinketSyncPollMs, "TRINKET_SYNC_CAST");
+            }
+
+            // The press demonstrably failed: settled, still usable, no cooldown.
+            if (RotationAction action = use_trinket_slot(api, slot,
+                    "Trinket retry with Major CDs", true); !action.is_none())
+            {
+                ++major_trinket_sync_.attempts;
+                major_trinket_sync_.dispatched_at = now;
+                if (telemetry_combat_active_) ++telemetry_.trinket_sync_retries;
+                return action;
+            }
+            return abandon_major_trinket(api, &*equipped, "retry_rejected");
+        }
+
         if (!cooldowns_allowed(api, state)) return no_action("Major trinkets held");
+
         for (int slot = 1; slot <= 2; ++slot) {
             if (trinket_mode(slot) != 2) continue;
+            if (trinket_slot_broken(slot)) continue;
+            const auto equipped = equipped_trinket(api, slot);
+            if (!equipped || !equipped->is_valid() || !equipped->spell.has_spell()) continue;
+            if (!equipped->can_use()) continue;
+            if (major_trinket_bypassed(slot, equipped->item_id, now)) continue;
+
+            // Never press an item into the tail of a hardcast.
+            if (!trinket_press_window_open(api)) {
+                if (major_trinket_sync_.armed_at < 0.0) {
+                    major_trinket_sync_.armed_at = now;
+                }
+                if ((now - major_trinket_sync_.armed_at) >= kTrinketSyncHoldMax) {
+                    major_trinket_sync_.slot = slot;
+                    major_trinket_sync_.item_id = equipped->item_id;
+                    return abandon_major_trinket(api, &*equipped, "no_free_window");
+                }
+                return wait_action(kTrinketSyncPollMs, "TRINKET_SYNC_CAST");
+            }
+
             if (RotationAction action = use_trinket_slot(api, slot, "Trinket with Major CDs");
                 !action.is_none())
             {
+                major_trinket_sync_.slot = slot;
+                major_trinket_sync_.item_id = equipped->item_id;
+                major_trinket_sync_.dispatched_at = now;
+                if (major_trinket_sync_.armed_at < 0.0) major_trinket_sync_.armed_at = now;
+                major_trinket_sync_.attempts = 1;
                 return action;
             }
         }
+
+        clear_major_trinket_sync();
         return no_action("No Major-synced trinket");
     }
 
@@ -4246,7 +5163,10 @@ private:
     RotationAction ascendance_burst_action(const rotation_api::IRotationAPI& api,
                                            const CombatState& state)
     {
-        if (!cooldowns_allowed(api, state)) return no_action("Cooldowns held");
+        if (!cooldowns_allowed(api, state)) {
+            clear_major_trinket_sync();
+            return no_action("Cooldowns held");
+        }
 
         const double stormkeeper_cd = spellbook_.stormkeeper != 0
             ? api.get_spell_cooldown_remaining(spellbook_.stormkeeper) : 999.0;
@@ -4260,9 +5180,15 @@ private:
                 last_ascendance_success_time_, kAscendanceSettle,
                 last_ascendance_dispatch_time_, kAscendanceAttempt, now, ascendance_eligible))
         {
+            // The package has already reached Ascendance, so the Mode-2 barrier
+            // is finished for this burst.
+            clear_major_trinket_sync();
             return no_action("Ascendance settling");
         }
-        if (!ascendance_eligible) return no_action("Ascendance not ready");
+        if (!ascendance_eligible) {
+            clear_major_trinket_sync();
+            return no_action("Ascendance not ready");
+        }
 
         const bool hold_for_stormkeeper = mini_cooldowns_allowed(api) &&
             !force_burst && !fight_ending &&
@@ -4297,7 +5223,8 @@ private:
         }
 
         // On-use trinkets configured With Major CDs fire after required DoT/VB
-        // setup but before Nature's Swiftness, racials, and Ascendance.
+        // setup but before Nature's Swiftness, racials, and Ascendance. This is
+        // a barrier: while it returns an action the package cannot advance.
         if (RotationAction action = major_synced_trinket_action(api, state); !action.is_none()) {
             return action;
         }
