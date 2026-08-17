@@ -1516,8 +1516,8 @@ private:
     static constexpr double kTrinketSyncBypass = 30.0;
     // Resource packets: a change may arrive one item/power publication after the
     // previous one, so the quiet window must exceed the 250 ms power interval.
-    // 0.35 s covers one interval plus scheduling jitter.
-    static constexpr double kMaelstromPacketQuiet = 0.35;
+    // 0.60 s is an A/B validation pass: two 250 ms intervals plus scheduling jitter.
+    static constexpr double kMaelstromPacketQuiet = 0.60;
     // Hard lifetime. Measured spacing between resolved rotational actions in the
     // v2.3.4 log has a median of 1.33 s, so 1.20 s closes a packet before the
     // next action can normally contaminate it.
