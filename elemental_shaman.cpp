@@ -2015,7 +2015,7 @@ private:
         const bool clean = !packet.ambiguous && !timed_out && !overlapped;
         const int maelstrom_max = std::max(1, api.get_player_power_max("maelstrom"));
         const bool capped = builder && packet.positive_total > 0 && current >= maelstrom_max;
-        const bool learnable = clean && !capped;
+        const bool learnable = builder && clean && !capped;
 
         if (telemetry_combat_active_) {
             ++telemetry_.maelstrom_packets_total;
@@ -2031,11 +2031,12 @@ private:
         if (!debug_diagnostics_) return;
         if (packet.changes == 0) return;
 
-        const char* quality = "full_clean";
+        const char* quality = "clean_spender";
         if (overlapped) quality = "overlap";
         else if (timed_out) quality = "timeout";
         else if (packet.ambiguous) quality = "ambiguous";
         else if (capped) quality = "capped";
+        else if (builder) quality = "full_clean";
 
         std::ostringstream out;
         out << "MAELSTROM_PACKET spell=" << packet.spell_id << '/'
