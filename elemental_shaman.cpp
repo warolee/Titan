@@ -1105,6 +1105,8 @@ private:
     static constexpr double kLightningRodProbeAges[kLightningRodProbeSnapshots] = {
         0.25, 0.75, 1.50
     };
+    // SimC Midnight Lightning Rod debuff. Probe-only; not used for APL.
+    static constexpr uint32_t kLightningRodSimcAuraId = 197209;
 
     std::vector<std::string> damage_debug_messages_;
     uint32_t last_damage_dispatch_log_spell_ = 0;
@@ -3389,6 +3391,23 @@ private:
             << " eq_id=" << spellbook_.earthquake;
         context.log(header.str());
 
+        const std::string simc_spell_name = api.get_spell_name(kLightningRodSimcAuraId);
+        {
+            std::ostringstream spell_line;
+            spell_line << "LR_SPELL id=" << kLightningRodSimcAuraId
+                << " name=\"" << (simc_spell_name.empty() ? std::string("<empty>") : simc_spell_name) << '"';
+            if (const auto spell = api.get_spell(kLightningRodSimcAuraId)) {
+                spell_line << " spell_name=\""
+                    << (spell->spell_name.empty() ? std::string("<empty>") : spell->spell_name) << '"'
+                    << " known=" << (spell->is_spell_known ? 1 : 0)
+                    << " player_spell=" << (spell->is_player_spell ? 1 : 0)
+                    << " override=" << spell->override_spell_id;
+            } else {
+                spell_line << " get_spell=0";
+            }
+            context.log(spell_line.str());
+        }
+
         for (int i = 0; i < unit_count; ++i) {
             const std::string& unit = units[i];
             const auto auras = api.get_debuffs(unit, false);
@@ -3423,6 +3442,22 @@ private:
                 context.log("LR_AURA unit=" + unit_label + " truncated=" +
                     std::to_string(static_cast<int>(auras.size()) - logged));
             }
+
+            const bool player_has = api.has_debuff(unit, kLightningRodSimcAuraId, true);
+            const bool any_has = api.has_debuff(unit, kLightningRodSimcAuraId, false);
+            const std::string aura_name = api.get_debuff_name(unit, kLightningRodSimcAuraId, false);
+            const std::string aura_src = api.get_debuff_source(unit, kLightningRodSimcAuraId, false);
+            std::ostringstream numeric;
+            numeric << "LR_NUMERIC unit=" << unit_label
+                << " id=" << kLightningRodSimcAuraId
+                << " name=\"" << (simc_spell_name.empty() ? std::string("<empty>") : simc_spell_name) << '"'
+                << " player_has=" << (player_has ? 1 : 0)
+                << " any_has=" << (any_has ? 1 : 0)
+                << " player_remain=" << format_seconds(api.get_debuff_remaining(unit, kLightningRodSimcAuraId, true))
+                << " any_remain=" << format_seconds(api.get_debuff_remaining(unit, kLightningRodSimcAuraId, false))
+                << " aura_name=\"" << (aura_name.empty() ? std::string("<empty>") : aura_name) << '"'
+                << " aura_src=" << (aura_src.empty() ? std::string("<none>") : aura_src);
+            context.log(numeric.str());
         }
     }
 
